@@ -537,7 +537,7 @@ async function runBatchFirewall() {
   const btn = document.getElementById("btn-run-firewall");
   const topBtn = document.getElementById("btn-top-run");
   const outDir = document.getElementById("out-dir").value.trim();
-  const secret = document.getElementById("secret-key").value;
+  const secret = "";
   const policyOverrides = collectPolicyFromForm();
 
   if (!outDir) {
@@ -681,12 +681,6 @@ async function runVerification(kind) {
 
 async function bootstrap() {
   document.querySelectorAll(".nav-btn").forEach(btn => btn.addEventListener("click", () => switchTab(btn.dataset.tab)));
-  document.getElementById("btn-toggle-secret").addEventListener("click", () => {
-    const inp = document.getElementById("secret-key");
-    const btn = document.getElementById("btn-toggle-secret");
-    inp.type = inp.type === "password" ? "text" : "password";
-    btn.textContent = inp.type === "password" ? "Show" : "Hide";
-  });
   document.getElementById("btn-run-firewall").addEventListener("click", runBatchFirewall);
   document.getElementById("btn-top-run").addEventListener("click", () => { switchTab("overview"); runBatchFirewall(); });
   document.getElementById("btn-mode-upload").addEventListener("click", () => setSourceMode("upload"));

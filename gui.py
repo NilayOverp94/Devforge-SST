@@ -12,6 +12,7 @@ import io
 import json
 import mimetypes
 import os
+import secrets
 import socket
 import socketserver
 import subprocess
@@ -36,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 GUI_DIR = REPO_ROOT / "gui"
 POLICY_PATH = REPO_ROOT / "config" / "policy.yaml"
 TOOLKIT_DIR = REPO_ROOT.parent / "Secret-Wards-ToolKit"
+_AUTO_SESSION_KEY = os.environ.get("RAKSHA_SECRET") or secrets.token_hex(32)
 
 
 def _load_policy_dict() -> dict[str, Any]:
@@ -129,7 +131,7 @@ def _run_pipeline_subprocess(
         pol_file.write_text(yaml.safe_dump(eff_policy, sort_keys=False), encoding="utf-8")
 
         env = dict(os.environ)
-        env["RAKSHA_SECRET"] = secret or "gui-session-ephemeral-key"
+        env["RAKSHA_SECRET"] = secret or _AUTO_SESSION_KEY
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
 
