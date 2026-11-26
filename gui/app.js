@@ -123,7 +123,6 @@ const TAB_TITLES = {
   linkage: ["Cross-Script Identity Linkage Explorer", "Verify deterministic keyed HMAC pseudonyms across CSV, TSV, JSON, FHIR R4, and free-text notes."],
   inspector: ["Sanitized Document Inspector", "Inspect UTF-8 cleaned records, age bands, shifted dates, and optional local input comparison."],
   sandbox: ["Live Multilingual De-identification Sandbox", "Test English, Devanagari, and Hinglish snippets with live PII span & clinical guard highlighting."],
-  policy: ["Privacy Policy & Verification Suite", "Configure k-anonymity thresholds in config/policy.yaml and run official verification checks."],
 };
 
 function switchTab(tab) {
@@ -367,44 +366,6 @@ function highlightSanitized(text) {
     .replace(/\[[A-Z_]{3,20}\]/g, m => `<span class="tok-redacted">${m}</span>`);
 }
 
-function renderPolicyForm(policy) {
-  state.policy = policy || {};
-  const fields = [
-    ["age_band_years", "Standard Age Band (yrs)", "number"],
-    ["high_risk_age_band_years", "High-Risk Age Band (yrs)", "number"],
-    ["elderly_cap_min_age", "Elderly Cap Min Age", "number"],
-    ["min_group_size", "k-Anonymity Min Group Size", "number"],
-    ["rare_condition_threshold", "Rare Condition Threshold", "number"],
-    ["date_shift_min_days", "Date Shift Min Days", "number"],
-    ["date_shift_max_days", "Date Shift Max Days", "number"],
-    ["pin_prefix_digits", "PIN Prefix Digits Kept", "number"],
-    ["max_json_depth", "Max JSON Depth Guard", "number"],
-    ["default_state_label", "Generalized Region Label", "text"],
-    ["suppress_dob", "Suppress Exact DOB", "bool"],
-    ["generalize_rare_district", "Coarsen Sparse/Rare Districts", "bool"],
-    ["encrypt_intermediate_vault", "AES-256-GCM In-Memory Vault", "bool"],
-  ];
-
-  document.getElementById("policy-form").innerHTML = fields.map(([k, label, kind]) => {
-    const val = state.policy[k];
-    if (kind === "bool") {
-      return `<label class="policy-check"><input type="checkbox" data-pkey="${k}" ${val ? "checked" : ""}> ${esc(label)}</label>`;
-    }
-    return `<div class="policy-field"><label>${esc(label)}</label><input type="${kind}" data-pkey="${k}" value="${esc(val ?? "")}"></div>`;
-  }).join("");
-}
-
-function collectPolicyFromForm() {
-  const out = {};
-  document.querySelectorAll("#policy-form [data-pkey]").forEach(el => {
-    const k = el.dataset.pkey;
-    if (el.type === "checkbox") out[k] = el.checked;
-    else if (el.type === "number") out[k] = Number(el.value);
-    else out[k] = el.value;
-  });
-  return out;
-}
-
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -543,7 +504,7 @@ async function runBatchFirewall() {
   const topBtn = document.getElementById("btn-top-run");
   const outDir = document.getElementById("out-dir").value.trim();
   const secret = "";
-  const policyOverrides = collectPolicyFromForm();
+  const policyOverrides = {};
 
   if (!outDir) {
     showBanner("run-banner", "Please specify an Output Release Directory.", false);
@@ -636,7 +597,7 @@ async function runSandbox() {
   const text = document.getElementById("sbx-input").value;
   const fmt = document.getElementById("sbx-format").value;
   const secret = document.getElementById("sbx-secret").value;
-  const res = await apiPost("/api/sandbox", { text, format: fmt, secret, policy_overrides: collectPolicyFromForm() });
+  const res = await apiPost("/api/sandbox", { text, format: fmt, secret, policy_overrides: {} });
 
   if (res.error) {
     document.getElementById("sbx-output").textContent = res.error;
@@ -677,27 +638,6 @@ async function runSandbox() {
   const counts = Object.entries(res.entity_counts || {}).map(([k, v]) => `${k}: ${v}`).join(" | ") || "none";
   document.getElementById("sbx-meta").innerHTML =
     `<strong>Pseudonym(s):</strong> <span class="mono">${esc(psns)}</span> &middot; <strong>Detected:</strong> ${esc(counts)}`;
-}
-
-async function runVerification(kind) {
-  const outEl = document.getElementById("verify-output");
-  const stEl = document.getElementById("verify-status");
-  stEl.textContent = `Running ${kind}...`;
-  outEl.textContent = "Executing offline verification check...";
-  const data = await apiPost("/api/verify", {
-    kind,
-    input_dir: document.getElementById("inp-dir").value,
-    output_dir: document.getElementById("out-dir").value,
-  });
-  if (data.error) {
-    stEl.innerHTML = `<span class="badge badge-warn">ERROR</span> ${esc(data.error)}`;
-    outEl.textContent = data.error;
-    return;
-  }
-  stEl.innerHTML = data.ok
-    ? `<span class="badge badge-ok">PASSED</span> Verification check <code>${esc(kind)}</code> exited 0.`
-    : `<span class="badge badge-warn">FAILED</span> Exit code ${data.returncode}`;
-  outEl.textContent = data.output || "(no output)";
 }
 
 async function bootstrap() {
@@ -778,16 +718,6 @@ async function bootstrap() {
     });
   });
   document.getElementById("btn-run-sandbox").addEventListener("click", runSandbox);
-  document.getElementById("btn-save-policy").addEventListener("click", async () => {
-    const res = await apiPost("/api/policy", { policy: collectPolicyFromForm() });
-    if (res.ok) {
-      renderPolicyForm(res.policy);
-      showBanner("policy-banner", "Saved updated privacy policy to config/policy.yaml.", true);
-    } else {
-      showBanner("policy-banner", res.error || "Failed to save policy.", false);
-    }
-  });
-  document.querySelectorAll(".verify-btn").forEach(b => b.addEventListener("click", () => runVerification(b.dataset.kind)));
 
   // Load initial defaults & health
   const health = await apiGet("/api/health");
@@ -808,7 +738,7 @@ async function bootstrap() {
   if (defs.toolkit_input_dir) {
     document.getElementById("btn-use-dev").classList.remove("hidden");
   }
-  renderPolicyForm(defs.policy || {});
+  state.policy = defs.policy || {};
 }
 
 document.addEventListener("DOMContentLoaded", bootstrap);

@@ -39,9 +39,6 @@
         <button class="nav-btn" data-tab="sandbox">
           <span class="nav-icon">&#9881;</span> Live Multilingual Sandbox
         </button>
-        <button class="nav-btn" data-tab="policy">
-          <span class="nav-icon">&#10003;</span> Policy &amp; Verification
-        </button>
       </nav>
 
       <div class="sidebar-footer">
@@ -336,36 +333,6 @@
             </div>
           </div>
           <div id="sbx-meta" class="summary-strip"></div>
-        </div>
-      </section>
-
-      <!-- TAB 6: Policy & Verification -->
-      <section id="tab-policy" class="tab-panel">
-        <div class="two-col">
-          <div class="card">
-            <div class="card-header">
-              <h2>Privacy Policy Rules (config/policy.yaml)</h2>
-              <button id="btn-save-policy" class="btn btn-primary btn-sm">Save Policy</button>
-            </div>
-            <div id="policy-form" class="policy-grid"></div>
-            <div id="policy-banner" class="banner hidden"></div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h2>Verification &amp; Compliance Suite</h2>
-              <span class="hint">Run toolkit validators &amp; unseen-chaos checks</span>
-            </div>
-            <div class="verify-buttons">
-              <button class="btn btn-secondary verify-btn" data-kind="validate">Validate Output Contract</button>
-              <button class="btn btn-secondary verify-btn" data-kind="check_dev">Run check_dev.py (Practice)</button>
-              <button class="btn btn-secondary verify-btn" data-kind="eval_attacks">Simulate Attack Arena (A3/A4/A5)</button>
-              <button class="btn btn-secondary verify-btn" data-kind="chaos">Run Unseen Chaos Test</button>
-              <button class="btn btn-primary verify-btn" data-kind="check_submission">Run check_submission.py (3 Runs)</button>
-            </div>
-            <div id="verify-status" class="summary-strip">Click a check above to run against the current configuration/output.</div>
-            <pre id="verify-output" class="terminal-pre">Ready.</pre>
-          </div>
         </div>
       </section>
     </main>

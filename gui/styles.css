@@ -518,27 +518,7 @@ input:focus, select:focus, textarea:focus {
 .tok-psn { background: #dbeafe; color: #1e40af; padding: 0 4px; border-radius: 3px; font-weight: 700; }
 .tok-redacted { background: #fef3c7; color: #92400e; padding: 0 3px; border-radius: 3px; font-weight: 600; }
 
-/* Policy & Verify */
-.policy-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.policy-field label { display: block; font-size: 11.5px; font-weight: 600; color: #334155; margin-bottom: 3px; }
-.policy-check { display: flex; align-items: center; gap: 7px; padding-top: 18px; font-size: 12.5px; font-weight: 500; }
-.policy-check input { width: auto; }
-.verify-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-.terminal-pre {
-  background: #0b162a;
-  color: #e2e8f0;
-  padding: 13px;
-  border-radius: 8px;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.45;
-  max-height: 400px;
-  overflow: auto;
-  margin: 0;
-  white-space: pre-wrap;
-}
-
 @media (max-width: 1020px) {
   .app-shell { grid-template-columns: 1fr; }
-  .form-grid, .kpi-grid, .two-col, .inspector-split, .policy-grid { grid-template-columns: 1fr; }
+  .form-grid, .kpi-grid, .two-col, .inspector-split { grid-template-columns: 1fr; }
 }
