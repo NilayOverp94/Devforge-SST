@@ -1,0 +1,33 @@
+# Raksha Kavach Privacy Firewall Policy Configuration
+# Controls detection thresholds, record linkage conservatism, and quasi-identifier generalization.
+
+# Quasi-identifier generalization
+age_band_years: 10              # Standard age band width (e.g. 40-49); always contains true age
+rare_age_band_years: 20         # Widened age band width for k-anonymity / rare-condition outliers
+elderly_cap_min_age: 80         # Ages >= 80 grouped into 80-99 to prevent extreme-age singling out
+pediatric_widen_max_age: 5      # Young pediatric records widened to 0-19 when sparse
+date_shift_min_days: 366        # Minimum shift magnitude (~1 year) to prevent intra-year visit_date collisions
+date_shift_max_days: 540        # Per-patient deterministic HMAC date offset in [-540,-366] U [366,540]
+min_group_size: 5               # k-anonymity target cell size on (district, gender, age_band)
+rare_condition_threshold: 3     # Conditions/procedures present in <= N patients trigger high-risk protection
+pin_prefix_digits: 3            # Keep 3-digit PIN prefix for standard risk; suppress if district suppressed
+suppress_dob: true              # Suppress/decade-band DOB so exact birth year does not narrow age bands
+generalize_rare_district: true  # Coarsen district to state level for high-risk rare-condition / k<min profiles
+high_risk_age_band_years: 20    # Band width applied when rare condition or sparse cell detected
+default_state_label: "IN-State" # Fallback generalized region when district is coarsened
+
+# Record linkage conservatism (precision > recall; false merges heavily penalized)
+linkage_name_threshold: 0.85
+linkage_relative_threshold: 0.82
+linkage_village_threshold: 0.82
+linkage_max_age_diff: 2
+linkage_require_corroboration_for_name: true
+
+# Ingestion & fail-safe quarantine bounds
+max_json_depth: 200
+max_file_bytes: 104857600       # 100 MB guard per file
+
+# Security & at-rest vault
+encrypt_intermediate_vault: true
+pseudonym_prefix: "PSN"
+pseudonym_length: 6
