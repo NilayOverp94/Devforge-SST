@@ -107,7 +107,7 @@ Pass `--no-browser` to start the local server without opening a browser tab auto
 - **Patient linking (`check_dev.py`):** **Precision 1.00, Recall 1.00, F0.5 1.00**, **0** wrongly merged pseudonyms.
 - **Raw copies of malformed files:** **0**.
 - **Attack Arena simulation (`tests/eval_attacks.py`):** `A3 record linkage = 0.020` (`0.022` vs raw), `A4 confident >= 0.5 = 0.021`, `A5 targeted = 0.411` (0 date matches).
-- **Performance:** **~2.0 seconds**, **~59 MB peak RSS** (within 2 CPU / 4 GB / 900s limits).
+- **Performance:** **~2.0 seconds**, **~59 MB peak RSS** (within 2 CPU / 4 GB / 900s limits) .
 
 ### Unseen-Format Chaos Test (`tests/test_chaos.py`)
 - Tested on unseen South/West Indian names, renamed CSV headers, unseen hospital MRN prefixes (`KGMU/26/...`), `DD.MM.YYYY` dates, unseen eponyms (`Hashimoto's thyroiditis`, `Guillain-Barre syndrome`), base64 attachments, and planted canary (`Lobsang Tenzing`): **0 / 19 PII leaked, 10 / 10 clinical probes preserved, 100% cross-script & fragmented linkage, homonyms separated**.
