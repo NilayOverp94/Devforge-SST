@@ -17,8 +17,18 @@ import yaml
 
 from src.detection import PIIDetector
 from src.ingestion import IngestedFile, ingest_directory
-from src.linkage import RecordClues, extract_clues_from_file, infer_file_date_hints, link_all_records
-from src.privacy import _sanitize_key_or_header, build_privacy_profiles, sanitize_csv_rows, sanitize_file
+from src.linkage import RecordClues, extract_clues_from_file, infer_file_date_hints, link_all_records, split_text_chunks
+from src.privacy import (
+    _sanitize_key_or_header,
+    _clean_json_node,
+    build_privacy_profiles,
+    finalize_text_doc,
+    preprocess_text_doc,
+    redact_text_chunk,
+    sanitize_csv_rows,
+    sanitize_file,
+    sanitize_json_list_chunk,
+)
 from src.reporting import write_outputs
 from src.security import EncryptedVault, KeyRing, safe_reason, sanitize_filename
 
@@ -81,6 +91,60 @@ def _sanitize_csv_chunk_worker(
     )
 
 
+def _sanitize_json_chunk_worker(
+    args: tuple[
+        str,
+        str,
+        str,
+        list[dict[str, Any]],
+        int,
+        str,
+        int,
+        dict[str, RecordClues],
+        dict[str, str | None],
+        dict[str, Any],
+        dict[str, str],
+        KeyRing,
+    ],
+) -> tuple[list[Any], list[dict[str, Any]], dict[str, int], int]:
+    (
+        rel_path,
+        root_key,
+        pkey,
+        items_chunk,
+        start_idx,
+        date_hint,
+        modal_year,
+        clues_by_loc,
+        unit_to_psn,
+        unit_profiles,
+        ref_lookup,
+        keyring,
+    ) = args
+    assert _WORKER_DETECTOR is not None
+    return sanitize_json_list_chunk(
+        rel_path=rel_path,
+        root_key=root_key,
+        pkey=pkey,
+        items_chunk=items_chunk,
+        start_idx=start_idx,
+        date_hint=date_hint,
+        modal_year=modal_year,
+        clues_by_loc=clues_by_loc,
+        unit_to_psn=unit_to_psn,
+        unit_profiles=unit_profiles,
+        ref_lookup=ref_lookup,
+        detector=_WORKER_DETECTOR,
+        keyring=keyring,
+    )
+
+
+def _redact_text_chunk_worker(args: tuple[str, list[str], list[str], str | None]) -> tuple[str, dict[str, int]]:
+    chunk, extra_pat, extra_rel, psn = args
+    assert _WORKER_DETECTOR is not None
+    return redact_text_chunk(chunk, extra_pat, extra_rel, psn, _WORKER_DETECTOR)
+
+
 def load_policy(policy_path: Path) -> dict[str, Any]:
     if not policy_path.is_file():
         return {}
@@ -119,185 +183,304 @@ def main() -> int:
     ingested_files: list[IngestedFile] = ingest_directory(
         inp_dir,
         max_json_depth=int(policy.get("max_json_depth", 200)),
-        max_file_bytes=int(policy.get("max_file_bytes", 104857600)),
+        max_file_bytes=int(policy.get("max_file_bytes", 4294967296)),
     )
 
     # Pass 2: Dataset-wide date-hint & hospital consensus inference
     date_hints, modal_year = infer_file_date_hints(ingested_files)
 
-    # Pass 3: Clue Extraction (parallelize across files when dataset is large)
-    all_clues: list[RecordClues] = []
-    clues_by_file: dict[str, list[RecordClues]] = {}
+    # Create a single shared worker pool when the dataset is large enough to benefit
     valid_files = [inf for inf in ingested_files if not inf.quarantine_reason]
     total_valid_bytes = sum(inf.raw_size for inf in valid_files)
     n_workers = min(os.cpu_count() or 1, 8)
-    use_pool = n_workers > 1 and total_valid_bytes >= 500_000
-
-    if use_pool and len(valid_files) >= 2:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=min(n_workers, len(valid_files)), initializer=_init_worker) as ex:
-            tasks = [(inf, date_hints.get(inf.rel_path, "dmy"), modal_year) for inf in valid_files]
-            for inf, f_clues in zip(valid_files, ex.map(_extract_clues_worker, tasks)):
-                clues_by_file[inf.rel_path] = f_clues
-                all_clues.extend(f_clues)
-    else:
-        for inf in valid_files:
-            f_clues = extract_clues_from_file(
-                inf,
-                detector=detector,
-                date_hint=date_hints.get(inf.rel_path, "dmy"),
-                modal_year=modal_year,
-            )
-            clues_by_file[inf.rel_path] = f_clues
-            all_clues.extend(f_clues)
-
-    # Pass 4: Conservative Cross-Script Record Linkage & HMAC Pseudonyms
-    unit_to_psn, psn_clusters, ref_lookup = link_all_records(all_clues, keyring=keyring, policy=policy)
-
-    # Pass 5: Cohort Risk Analysis & Privacy Profiles
-    _, unit_profiles = build_privacy_profiles(
-        all_clues=all_clues,
-        unit_to_psn=unit_to_psn,
-        psn_clusters=psn_clusters,
-        keyring=keyring,
-        policy=policy,
+    has_big_single = any(
+        (inf.fmt in ("csv", "tsv") and inf.data and len(inf.data) > 4001)
+        or (inf.fmt == "text" and inf.text and len(inf.text) > 100_000)
+        or (inf.fmt == "json" and inf.raw_size >= 400_000)
+        for inf in valid_files
+    )
+    use_pool = n_workers > 1 and (total_valid_bytes >= 500_000 or has_big_single)
+    pool: concurrent.futures.ProcessPoolExecutor | None = (
+        concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker)
+        if use_pool
+        else None
     )
 
-    # Pass 6: Sanitization, Generalization, Filename Scrubbing, & Deterministic Export
-    file_entries: list[dict[str, Any]] = []
-    record_entries: list[dict[str, Any]] = []
-    entity_counts: dict[str, int] = {}
-    stats: dict[str, int] = {"records_generalized": 0, "records_suppressed": 0, "records_quarantined": 0}
-    used_output_paths: set[str] = set()
+    try:
+        # Pass 3: Clue Extraction (parallelize across files when multiple large files)
+        all_clues: list[RecordClues] = []
+        clues_by_file: dict[str, list[RecordClues]] = {}
+        if pool is not None and len(valid_files) >= 2:
+            tasks = [(inf, date_hints.get(inf.rel_path, "dmy"), modal_year) for inf in valid_files]
+            for inf, f_clues in zip(valid_files, pool.map(_extract_clues_worker, tasks)):
+                clues_by_file[inf.rel_path] = f_clues
+                all_clues.extend(f_clues)
+        else:
+            for inf in valid_files:
+                f_clues = extract_clues_from_file(
+                    inf,
+                    detector=detector,
+                    date_hint=date_hints.get(inf.rel_path, "dmy"),
+                    modal_year=modal_year,
+                )
+                clues_by_file[inf.rel_path] = f_clues
+                all_clues.extend(f_clues)
 
-    for inf in ingested_files:
-        entry: dict[str, Any] = {"input_sha256": inf.sha256}
-        if inf.quarantine_reason:
-            entry.update(output=None, status="quarantined", reason=inf.quarantine_reason)
-            file_entries.append(entry)
-            continue
+        # Pass 4: Conservative Cross-Script Record Linkage & HMAC Pseudonyms
+        unit_to_psn, psn_clusters, ref_lookup = link_all_records(all_clues, keyring=keyring, policy=policy)
 
-        try:
-            f_clues = clues_by_file.get(inf.rel_path, [])
-            doc_psn: str | None = None
-            if len(f_clues) == 1:
-                doc_psn = unit_to_psn.get(f_clues[0].unit_id)
+        # Pass 5: Cohort Risk Analysis & Privacy Profiles
+        _, unit_profiles = build_privacy_profiles(
+            all_clues=all_clues,
+            unit_to_psn=unit_to_psn,
+            psn_clusters=psn_clusters,
+            keyring=keyring,
+            policy=policy,
+        )
 
-            if inf.fmt in ("csv", "tsv") and inf.data and len(inf.data) > 4001 and n_workers > 1:
-                rows = inf.data
-                header = list(rows[0])
-                body = rows[1:]
-                col_roles = [
-                    detector.classify_column_header(h, [r[i] for r in body[:25] if i < len(r)])
-                    for i, h in enumerate(header)
-                ]
-                used_headers: set[str] = set()
-                clean_header: list[str] = []
-                for h in header:
-                    ch, _ = _sanitize_key_or_header(h, detector, ref_lookup, keyring, used_headers, entity_counts)
-                    used_headers.add(ch)
-                    clean_header.append(ch)
-                psn_col_idx: int | None = None
-                for preferred in ("MRN", "PATIENT_NAME"):
-                    if preferred in col_roles:
-                        psn_col_idx = col_roles.index(preferred)
-                        break
+        # Pass 6: Sanitization, Generalization, Filename Scrubbing, & Deterministic Export
+        file_entries: list[dict[str, Any]] = []
+        record_entries: list[dict[str, Any]] = []
+        entity_counts: dict[str, int] = {}
+        stats: dict[str, int] = {"records_generalized": 0, "records_suppressed": 0, "records_quarantined": 0}
+        used_output_paths: set[str] = set()
 
-                h_buf = io.StringIO()
-                csv.writer(h_buf, delimiter=inf.delimiter or ",", lineterminator="\n").writerow(clean_header)
-                clues_by_loc = {rc.loc: rc for rc in f_clues}
+        for inf in ingested_files:
+            entry: dict[str, Any] = {"input_sha256": inf.sha256}
+            if inf.quarantine_reason:
+                entry.update(output=None, status="quarantined", reason=inf.quarantine_reason)
+                file_entries.append(entry)
+                continue
 
-                chunk_size = max(2000, (len(body) + n_workers - 1) // n_workers)
-                chunk_tasks = []
-                for start in range(0, len(body), chunk_size):
-                    end = min(len(body), start + chunk_size)
-                    sub_clues: dict[str, RecordClues] = {}
-                    sub_u2p: dict[str, str | None] = {}
-                    sub_prof: dict[str, Any] = {}
-                    for r_i in range(start, end):
-                        loc = f"row:{r_i}"
-                        rc = clues_by_loc.get(loc)
-                        if rc is not None:
-                            sub_clues[loc] = rc
-                            uid = rc.unit_id
-                        else:
-                            uid = f"{inf.rel_path}|{loc}"
-                        if uid in unit_to_psn:
-                            sub_u2p[uid] = unit_to_psn[uid]
-                        if uid in unit_profiles:
-                            sub_prof[uid] = unit_profiles[uid]
-                    chunk_tasks.append((
-                        inf.rel_path,
-                        inf.delimiter or ",",
-                        col_roles,
-                        psn_col_idx,
-                        body[start:end],
-                        start,
-                        date_hints.get(inf.rel_path, "dmy"),
-                        modal_year,
-                        sub_clues,
-                        sub_u2p,
-                        sub_prof,
-                    ))
+            try:
+                f_clues = clues_by_file.get(inf.rel_path, [])
+                doc_psn: str | None = None
+                if len(f_clues) == 1:
+                    doc_psn = unit_to_psn.get(f_clues[0].unit_id)
 
-                text_parts = [h_buf.getvalue()]
-                file_records: list[dict[str, Any]] = []
-                with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker) as ex:
-                    for c_text, c_recs, c_counts, c_gen in ex.map(_sanitize_csv_chunk_worker, chunk_tasks):
+                if pool is not None and inf.fmt in ("csv", "tsv") and inf.data and len(inf.data) > 4001:
+                    rows = inf.data
+                    header = list(rows[0])
+                    body = rows[1:]
+                    col_roles = [
+                        detector.classify_column_header(h, [r[i] for r in body[:25] if i < len(r)])
+                        for i, h in enumerate(header)
+                    ]
+                    used_headers: set[str] = set()
+                    clean_header: list[str] = []
+                    for h in header:
+                        ch, _ = _sanitize_key_or_header(h, detector, ref_lookup, keyring, used_headers, entity_counts)
+                        used_headers.add(ch)
+                        clean_header.append(ch)
+                    psn_col_idx: int | None = None
+                    for preferred in ("MRN", "PATIENT_NAME"):
+                        if preferred in col_roles:
+                            psn_col_idx = col_roles.index(preferred)
+                            break
+
+                    h_buf = io.StringIO()
+                    csv.writer(h_buf, delimiter=inf.delimiter or ",", lineterminator="\n").writerow(clean_header)
+                    clues_by_loc = {rc.loc: rc for rc in f_clues}
+
+                    chunk_size = max(2000, (len(body) + n_workers - 1) // n_workers)
+                    chunk_tasks = []
+                    for start in range(0, len(body), chunk_size):
+                        end = min(len(body), start + chunk_size)
+                        sub_clues: dict[str, RecordClues] = {}
+                        sub_u2p: dict[str, str | None] = {}
+                        sub_prof: dict[str, Any] = {}
+                        for r_i in range(start, end):
+                            loc = f"row:{r_i}"
+                            rc = clues_by_loc.get(loc)
+                            if rc is not None:
+                                sub_clues[loc] = rc
+                                uid = rc.unit_id
+                            else:
+                                uid = f"{inf.rel_path}|{loc}"
+                            if uid in unit_to_psn:
+                                sub_u2p[uid] = unit_to_psn[uid]
+                            if uid in unit_profiles:
+                                sub_prof[uid] = unit_profiles[uid]
+                        chunk_tasks.append((
+                            inf.rel_path,
+                            inf.delimiter or ",",
+                            col_roles,
+                            psn_col_idx,
+                            body[start:end],
+                            start,
+                            date_hints.get(inf.rel_path, "dmy"),
+                            modal_year,
+                            sub_clues,
+                            sub_u2p,
+                            sub_prof,
+                        ))
+
+                    text_parts = [h_buf.getvalue()]
+                    file_records: list[dict[str, Any]] = []
+                    for c_text, c_recs, c_counts, c_gen in pool.map(_sanitize_csv_chunk_worker, chunk_tasks):
                         text_parts.append(c_text)
                         file_records.extend(c_recs)
                         for k, v in c_counts.items():
                             entity_counts[k] = entity_counts.get(k, 0) + v
                         if c_gen:
                             stats["records_generalized"] = stats.get("records_generalized", 0) + c_gen
-                sanitized_text = "".join(text_parts)
-            else:
-                sanitized_text, file_records = sanitize_file(
-                    inf=inf,
-                    date_hint=date_hints.get(inf.rel_path, "dmy"),
-                    modal_year=modal_year,
-                    clues_list=f_clues,
-                    unit_to_psn=unit_to_psn,
-                    unit_profiles=unit_profiles,
-                    ref_lookup=ref_lookup,
-                    detector=detector,
+                    sanitized_text = "".join(text_parts)
+
+                elif (
+                    pool is not None
+                    and inf.fmt == "json"
+                    and isinstance(inf.data, dict)
+                    and not inf.rel_path.startswith("clean/")
+                    and inf.rel_path not in {"misc/helpdesk_tickets.json", "misc/scanned_consent_form.json", "misc/patient_index.json"}
+                    and not ("patient" in inf.data and isinstance(inf.data["patient"], dict))
+                    and any(
+                        isinstance(v, list) and len(v) > 2000 and all(isinstance(x, dict) for x in v)
+                        for k, v in inf.data.items()
+                        if k.lower() in ("visits", "patients", "results", "records", "claims")
+                    )
+                ):
+                    clues_by_loc = {rc.loc: rc for rc in f_clues}
+                    used_top: set[str] = set()
+                    cleaned_root: dict[str, Any] = {}
+                    file_records = []
+                    str_cache: dict[tuple[str, bool], list[Any]] = {}
+                    d_hint = date_hints.get(inf.rel_path, "dmy")
+                    for k, v in inf.data.items():
+                        sk, _ = _sanitize_key_or_header(str(k), detector, ref_lookup, keyring, used_top, entity_counts)
+                        used_top.add(sk)
+                        if isinstance(v, list) and len(v) > 2000 and all(isinstance(x, dict) for x in v):
+                            pkey = k.replace("~", "~0").replace("/", "~1")
+                            chunk_size = max(500, (len(v) + n_workers - 1) // n_workers)
+                            j_tasks = []
+                            for start in range(0, len(v), chunk_size):
+                                end = min(len(v), start + chunk_size)
+                                sub_clues = {}
+                                sub_u2p = {}
+                                sub_prof = {}
+                                for idx in range(start, end):
+                                    loc = f"/{pkey}/{idx}"
+                                    rc = clues_by_loc.get(loc)
+                                    if rc is not None:
+                                        sub_clues[loc] = rc
+                                        uid = rc.unit_id
+                                    else:
+                                        uid = f"{inf.rel_path}|{loc}"
+                                    if uid in unit_to_psn:
+                                        sub_u2p[uid] = unit_to_psn[uid]
+                                    if uid in unit_profiles:
+                                        sub_prof[uid] = unit_profiles[uid]
+                                j_tasks.append((
+                                    inf.rel_path, str(k), pkey, v[start:end], start, d_hint, modal_year,
+                                    sub_clues, sub_u2p, sub_prof, ref_lookup, keyring,
+                                ))
+                            out_list: list[Any] = []
+                            for c_items, c_recs, c_counts, c_gen in pool.map(_sanitize_json_chunk_worker, j_tasks):
+                                out_list.extend(c_items)
+                                file_records.extend(c_recs)
+                                for ek, ev in c_counts.items():
+                                    entity_counts[ek] = entity_counts.get(ek, 0) + ev
+                                if c_gen:
+                                    stats["records_generalized"] = stats.get("records_generalized", 0) + c_gen
+                            cleaned_root[sk] = out_list
+                        elif isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                            pkey = k.replace("~", "~0").replace("/", "~1")
+                            out_list, c_recs, c_counts, c_gen = sanitize_json_list_chunk(
+                                inf.rel_path, str(k), pkey, v, 0, d_hint, modal_year,
+                                clues_by_loc, unit_to_psn, unit_profiles, ref_lookup, detector, keyring,
+                            )
+                            cleaned_root[sk] = out_list
+                            file_records.extend(c_recs)
+                            for ek, ev in c_counts.items():
+                                entity_counts[ek] = entity_counts.get(ek, 0) + ev
+                            if c_gen:
+                                stats["records_generalized"] = stats.get("records_generalized", 0) + c_gen
+                        else:
+                            cleaned_root[sk] = _clean_json_node(
+                                v, [str(k).lower()], None, None, None, [False], [False],
+                                d_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_cache,
+                            )
+                    sanitized_text = json.dumps(cleaned_root, ensure_ascii=False, indent=2) + "\n"
+
+                elif pool is not None and inf.fmt == "text" and inf.text and len(inf.text) > 100_000:
+                    rc = f_clues[0] if f_clues else None
+                    uid = rc.unit_id if rc else f"{inf.rel_path}|doc"
+                    psn = unit_to_psn.get(uid)
+                    prof = unit_profiles.get(uid)
+                    if (not rc or not rc.is_patient_record) and not detector.detect_text(inf.text, allow_pin_scan=False):
+                        sanitized_text = inf.text
+                        file_records = [{"file": f"sanitized/{inf.rel_path}", "loc": "doc", "patient": None}]
+                    else:
+                        work, gen_any = preprocess_text_doc(
+                            inf.text, date_hints.get(inf.rel_path, "dmy"), modal_year, prof, entity_counts,
+                        )
+                        extra_pat = rc.patient_names if rc else []
+                        extra_rel = rc.relative_names if rc else []
+                        chunks = split_text_chunks(work)
+                        t_tasks = [
+                            (ch, extra_pat, extra_rel, psn if idx == 0 else None)
+                            for idx, ch in enumerate(chunks)
+                        ]
+                        cleaned_parts: list[str] = []
+                        for c_out, c_counts in pool.map(_redact_text_chunk_worker, t_tasks):
+                            cleaned_parts.append(c_out)
+                            for ek, ev in c_counts.items():
+                                entity_counts[ek] = entity_counts.get(ek, 0) + ev
+                        file_records = []
+                        sanitized_text = finalize_text_doc(
+                            "".join(cleaned_parts), inf.rel_path, rc, psn, prof, gen_any, stats, file_records,
+                        )
+
+                else:
+                    sanitized_text, file_records = sanitize_file(
+                        inf=inf,
+                        date_hint=date_hints.get(inf.rel_path, "dmy"),
+                        modal_year=modal_year,
+                        clues_list=f_clues,
+                        unit_to_psn=unit_to_psn,
+                        unit_profiles=unit_profiles,
+                        ref_lookup=ref_lookup,
+                        detector=detector,
+                        keyring=keyring,
+                        entity_counts=entity_counts,
+                        stats=stats,
+                    )
+
+                # Release raw parsed payload immediately after sanitization to bound memory
+                inf.data = None
+                inf.text = None
+
+                clean_rel, was_renamed = sanitize_filename(
+                    inf.rel_path,
+                    file_sha256=inf.sha256,
                     keyring=keyring,
-                    entity_counts=entity_counts,
-                    stats=stats,
+                    has_pii_fn=detector.has_pii_in_identifier,
+                    pseudonym=doc_psn,
                 )
+                # Ensure unique output relative path if two PII-named files collapsed
+                while clean_rel in used_output_paths:
+                    p = Path(clean_rel)
+                    clean_rel = (p.parent / f"{p.stem}_{keyring.safe_tag(inf.sha256, 4)}{p.suffix}").as_posix()
+                used_output_paths.add(clean_rel)
 
-            # Release raw parsed payload immediately after sanitization to bound memory
-            inf.data = None
-            inf.text = None
+                if was_renamed:
+                    for rec in file_records:
+                        rec["file"] = f"sanitized/{clean_rel}"
 
-            clean_rel, was_renamed = sanitize_filename(
-                inf.rel_path,
-                file_sha256=inf.sha256,
-                keyring=keyring,
-                has_pii_fn=detector.has_pii_in_identifier,
-                pseudonym=doc_psn,
-            )
-            # Ensure unique output relative path if two PII-named files collapsed
-            while clean_rel in used_output_paths:
-                p = Path(clean_rel)
-                clean_rel = (p.parent / f"{p.stem}_{keyring.safe_tag(inf.sha256, 4)}{p.suffix}").as_posix()
-            used_output_paths.add(clean_rel)
+                dest = san_dir / clean_rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with dest.open("w", encoding="utf-8", newline="") as f_out:
+                    f_out.write(sanitized_text)
 
-            if was_renamed:
-                for rec in file_records:
-                    rec["file"] = f"sanitized/{clean_rel}"
+                entry.update(output=f"sanitized/{clean_rel}", status="sanitized")
+                record_entries.extend(file_records)
 
-            dest = san_dir / clean_rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with dest.open("w", encoding="utf-8", newline="") as f_out:
-                f_out.write(sanitized_text)
+            except Exception as exc:
+                entry.update(output=None, status="quarantined", reason=safe_reason(exc))
 
-            entry.update(output=f"sanitized/{clean_rel}", status="sanitized")
-            record_entries.extend(file_records)
-
-        except Exception as exc:
-            entry.update(output=None, status="quarantined", reason=safe_reason(exc))
-
-        file_entries.append(entry)
+            file_entries.append(entry)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
 
     if vault is not None:
         vault.purge()

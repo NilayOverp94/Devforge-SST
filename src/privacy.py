@@ -29,6 +29,7 @@ from .linkage import (
     norm_mrn_key,
     parse_age_val,
     parse_date_flex,
+    split_text_chunks,
 )
 from .security import KeyRing
 
@@ -561,6 +562,301 @@ def sanitize_csv_rows(
 
 # --------------------------------------------------------------------------- JSON (Non-FHIR) Sanitizer
 
+def _clean_json_node(
+    node: Any,
+    path_parts: list[str],
+    rc: RecordClues | None,
+    psn: str | None,
+    prof: PrivacyProfile | None,
+    psn_injected: list[bool],
+    gen_flag: list[bool],
+    date_hint: str,
+    modal_year: int,
+    detector: PIIDetector,
+    ref_lookup: dict[str, str],
+    keyring: KeyRing,
+    entity_counts: dict[str, int],
+    str_spans_cache: dict[tuple[str, bool], list[Any]],
+) -> Any:
+    if isinstance(node, dict):
+        used_k: set[str] = set()
+        out_d: dict[str, Any] = {}
+        for k, v in node.items():
+            sk, key_changed = _sanitize_key_or_header(str(k), detector, ref_lookup, keyring, used_k, entity_counts)
+            used_k.add(sk)
+            if key_changed and isinstance(v, str) and norm_mrn_key(v) in ref_lookup:
+                entity_counts["MRN"] = entity_counts.get("MRN", 0) + 1
+                out_d[sk] = ref_lookup[norm_mrn_key(v)]
+            else:
+                out_d[sk] = _clean_json_node(
+                    v, path_parts + [str(k).lower()], rc, psn, prof, psn_injected, gen_flag,
+                    date_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_spans_cache,
+                )
+        return out_d
+
+    if isinstance(node, list):
+        return [
+            _clean_json_node(
+                x, path_parts, rc, psn, prof, psn_injected, gen_flag,
+                date_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_spans_cache,
+            )
+            for x in node
+        ]
+
+    if node is None or isinstance(node, bool):
+        return node
+
+    leaf_key = path_parts[-1] if path_parts else ""
+    parent_key = path_parts[-2] if len(path_parts) >= 2 else ""
+    extra_pat = rc.patient_names if rc else []
+    extra_rel = rc.relative_names if rc else []
+
+    # Metadata path keys (e.g. _export_meta.source_path)
+    if leaf_key in ("source_path", "filepath", "file_path", "export_path"):
+        if isinstance(node, str) and node.strip():
+            detector.redact_text(node.replace("_", " ").replace("\\", " / "), allow_pin_scan=False, entity_counts=entity_counts)
+            return "[REDACTED_PATH]"
+        return node
+
+    # Base64 attachment handling
+    if isinstance(node, str) and leaf_key == "data":
+        dec = try_decode_base64_text(node)
+        if dec is not None:
+            cleaned_dec = detector.redact_text(
+                dec,
+                extra_patient_names=extra_pat,
+                extra_relative_names=extra_rel,
+                allow_pin_scan=True,
+                pseudonym=psn if (psn and not psn_injected[0]) else None,
+                entity_counts=entity_counts,
+            )
+            if psn and psn in cleaned_dec:
+                psn_injected[0] = True
+            return encode_base64_text(cleaned_dec)
+
+    # Direct identifiers by semantic key
+    if leaf_key in ("uhid", "patient_ref", "hospital_uhid", "reg_no", "mrn"):
+        if str(node).strip():
+            entity_counts["MRN"] = entity_counts.get("MRN", 0) + 1
+            if psn:
+                psn_injected[0] = True
+                return psn
+            return "[MRN]"
+        return node
+
+    if leaf_key in ("aadhar_no", "aadhaar", "aadhaar_no"):
+        if node is not None and str(node).strip():
+            entity_counts["AADHAAR"] = entity_counts.get("AADHAAR", 0) + 1
+            return "[AADHAAR]"
+        return node
+
+    if leaf_key in ("abha", "abha_no", "abha_number", "abha_address"):
+        if node is not None and str(node).strip():
+            etype = "ABHA_ADDRESS" if "address" in leaf_key else "ABHA_NUMBER"
+            entity_counts[etype] = entity_counts.get(etype, 0) + 1
+            return f"[{etype}]"
+        return node
+
+    if leaf_key in ("mobile", "phone", "callback"):
+        if node is not None and str(node).strip():
+            entity_counts["PHONE"] = entity_counts.get("PHONE", 0) + 1
+            return "[PHONE]"
+        return node
+
+    if leaf_key == "email":
+        if node is not None and str(node).strip():
+            entity_counts["EMAIL"] = entity_counts.get("EMAIL", 0) + 1
+            return "[EMAIL]"
+        return node
+
+    if leaf_key in ("patient_name",) or (leaf_key == "name" and parent_key in ("patient", "raised_by")):
+        if isinstance(node, str) and node.strip():
+            entity_counts["PATIENT_NAME"] = entity_counts.get("PATIENT_NAME", 0) + 1
+            if psn and not psn_injected[0]:
+                psn_injected[0] = True
+                return psn
+            return "[PATIENT_NAME]"
+        return node
+
+    if parent_key == "name" and leaf_key in ("first", "last", "local"):
+        if isinstance(node, str) and node.strip():
+            entity_counts["PATIENT_NAME"] = entity_counts.get("PATIENT_NAME", 0) + 1
+            if psn and leaf_key == "first" and not psn_injected[0]:
+                psn_injected[0] = True
+                return psn
+            return "[PATIENT_NAME]"
+        return node
+
+    if parent_key == "guardian" and leaf_key == "name":
+        if isinstance(node, str) and node.strip():
+            entity_counts["RELATIVE_NAME"] = entity_counts.get("RELATIVE_NAME", 0) + 1
+            return "[RELATIVE_NAME]"
+        return node
+
+    if leaf_key == "dob":
+        if node is not None and str(node).strip():
+            entity_counts["DOB"] = entity_counts.get("DOB", 0) + 1
+            gen_flag[0] = True
+            return "[DOB]"
+        return node
+
+    if leaf_key == "age" and prof is not None:
+        a, _ = parse_age_val(node)
+        if a is not None:
+            gen_flag[0] = True
+            return format_age_band(a, prof)
+        return node
+
+    if leaf_key == "age_sex" and prof is not None:
+        a, g = parse_age_val(node)
+        if a is not None:
+            gen_flag[0] = True
+            band = format_age_band(a, prof)
+            return f"{band}/{g}" if g else band
+        return node
+
+    if leaf_key in ("village", "city"):
+        if isinstance(node, str) and node.strip():
+            entity_counts["VILLAGE"] = entity_counts.get("VILLAGE", 0) + 1
+            gen_flag[0] = True
+            return "[VILLAGE]"
+        return node
+
+    if leaf_key == "tehsil":
+        if isinstance(node, str) and node.strip():
+            gen_flag[0] = True
+            return "[TEHSIL]"
+        return node
+
+    if leaf_key == "district" and prof is not None:
+        if prof.generalize_district and isinstance(node, str) and node.strip():
+            gen_flag[0] = True
+            return prof.state_label
+        return node
+
+    if leaf_key in ("pin", "postalcode") and prof is not None:
+        if isinstance(node, str) and node.strip():
+            entity_counts["PIN"] = entity_counts.get("PIN", 0) + 1
+            gen_flag[0] = True
+            return format_pin_generalized(node, prof)
+        return node
+
+    if leaf_key in ("visit_date", "collected", "date", "registered_on") and prof is not None:
+        if isinstance(node, str) and node.strip():
+            shifted, _ = shift_date_value(node, date_hint, prof.date_shift, modal_year)
+            return shifted
+        return node
+
+    if leaf_key in ("doctor", "referred_by"):
+        return node
+
+    if isinstance(node, str):
+        if not node or not node.strip():
+            return node
+        allow_pin = leaf_key in ("line", "address", "address_note")
+        has_extra = False
+        if extra_pat or extra_rel:
+            n_low = node.lower()
+            for nm in extra_pat:
+                for tok in nm.split():
+                    if len(tok) >= 3 and tok.lower() in n_low:
+                        has_extra = True
+                        break
+                if has_extra:
+                    break
+            if not has_extra:
+                for nm in extra_rel:
+                    for tok in nm.split():
+                        if len(tok) >= 3 and tok.lower() in n_low:
+                            has_extra = True
+                            break
+                    if has_extra:
+                        break
+        if not has_extra:
+            ckey = (node, allow_pin)
+            cached_spans = str_spans_cache.get(ckey)
+            if cached_spans is None:
+                cached_spans = detector.detect_text(node, allow_pin_scan=allow_pin)
+                if len(str_spans_cache) < 65536:
+                    str_spans_cache[ckey] = cached_spans
+            if not cached_spans:
+                cleaned = node
+            else:
+                parts = []
+                cur = 0
+                for sp in cached_spans:
+                    parts.append(node[cur:sp.start])
+                    entity_counts[sp.pii_type] = entity_counts.get(sp.pii_type, 0) + 1
+                    parts.append(f"{sp.surface[:3]}***" if sp.pii_type == "PIN" else f"[{sp.pii_type}]")
+                    cur = sp.end
+                parts.append(node[cur:])
+                cleaned = "".join(parts)
+        else:
+            cleaned = detector.redact_text(
+                node,
+                extra_patient_names=extra_pat,
+                extra_relative_names=extra_rel,
+                allow_pin_scan=allow_pin,
+                entity_counts=entity_counts,
+            )
+        if allow_pin and prof and prof.generalize_district and rc and rc.district:
+            cleaned = re.sub(re.escape(rc.district), prof.state_label, cleaned, flags=re.I)
+        return cleaned
+
+    return node
+
+
+def sanitize_json_list_chunk(
+    rel_path: str,
+    root_key: str,
+    pkey: str,
+    items_chunk: list[dict[str, Any]],
+    start_idx: int,
+    date_hint: str,
+    modal_year: int,
+    clues_by_loc: dict[str, RecordClues],
+    unit_to_psn: dict[str, str | None],
+    unit_profiles: dict[str, PrivacyProfile],
+    ref_lookup: dict[str, str],
+    detector: PIIDetector,
+    keyring: KeyRing,
+) -> tuple[list[Any], list[dict[str, Any]], dict[str, int], int]:
+    """Sanitize a slice of a JSON list-of-dicts array."""
+    str_spans_cache: dict[tuple[str, bool], list[Any]] = {}
+    entity_counts: dict[str, int] = {}
+    records_out: list[dict[str, Any]] = []
+    generalized_count = 0
+    out_list: list[Any] = []
+    rk_low = root_key.lower()
+
+    for offset, item in enumerate(items_chunk):
+        i = start_idx + offset
+        loc = f"/{pkey}/{i}"
+        rc = clues_by_loc.get(loc)
+        uid = rc.unit_id if rc else f"{rel_path}|{loc}"
+        psn = unit_to_psn.get(uid)
+        prof = unit_profiles.get(uid)
+        psn_inj = [False]
+        gen_flag = [False]
+        c_item = _clean_json_node(
+            item, [rk_low], rc, psn, prof, psn_inj, gen_flag,
+            date_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_spans_cache,
+        )
+        if psn and not psn_inj[0] and isinstance(c_item, dict):
+            c_item["patient_ref"] = psn
+        out_list.append(c_item)
+        if gen_flag[0]:
+            generalized_count += 1
+        records_out.append({
+            "file": f"sanitized/{rel_path}",
+            "loc": loc,
+            "patient": psn,
+            **({"status": "generalized"} if gen_flag[0] else {}),
+        })
+
+    return out_list, records_out, entity_counts, generalized_count
+
+
 def _sanitize_json(
     inf: IngestedFile,
     date_hint: str,
@@ -575,7 +871,7 @@ def _sanitize_json(
     stats: dict[str, int],
     records_out: list[dict[str, Any]],
 ) -> str:
-    data = copy.deepcopy(inf.data)
+    data = inf.data
     rel = inf.rel_path
 
     # Clean file shortcut (e.g. ward_census.json)
@@ -595,194 +891,7 @@ def _sanitize_json(
     )
     is_non_patient_misc = rel in {"misc/helpdesk_tickets.json", "misc/scanned_consent_form.json", "misc/patient_index.json"}
 
-    def _clean_node(
-        node: Any,
-        path_parts: list[str],
-        rc: RecordClues | None,
-        psn: str | None,
-        prof: PrivacyProfile | None,
-        psn_injected: list[bool],
-        gen_flag: list[bool],
-    ) -> Any:
-        if isinstance(node, dict):
-            used_k: set[str] = set()
-            out_d: dict[str, Any] = {}
-            for k, v in node.items():
-                sk, key_changed = _sanitize_key_or_header(str(k), detector, ref_lookup, keyring, used_k, entity_counts)
-                used_k.add(sk)
-                # If key was an MRN/Name and v is string MRN in patient_index.by_name, map v too
-                if key_changed and isinstance(v, str) and norm_mrn_key(v) in ref_lookup:
-                    entity_counts["MRN"] = entity_counts.get("MRN", 0) + 1
-                    out_d[sk] = ref_lookup[norm_mrn_key(v)]
-                else:
-                    out_d[sk] = _clean_node(v, path_parts + [str(k).lower()], rc, psn, prof, psn_injected, gen_flag)
-            return out_d
-
-        if isinstance(node, list):
-            return [_clean_node(x, path_parts, rc, psn, prof, psn_injected, gen_flag) for x in node]
-
-        if node is None or isinstance(node, bool):
-            return node
-
-        leaf_key = path_parts[-1] if path_parts else ""
-        parent_key = path_parts[-2] if len(path_parts) >= 2 else ""
-        extra_pat = rc.patient_names if rc else []
-        extra_rel = rc.relative_names if rc else []
-
-        # Metadata path keys (e.g. _export_meta.source_path)
-        if leaf_key in ("source_path", "filepath", "file_path", "export_path"):
-            if isinstance(node, str) and node.strip():
-                cleaned_path = detector.redact_text(node.replace("_", " ").replace("\\", " / "), allow_pin_scan=False, entity_counts=entity_counts)
-                # Ensure no raw patient segment survives
-                return "[REDACTED_PATH]" if cleaned_path != node else "[REDACTED_PATH]"
-            return node
-
-        # Base64 attachment handling
-        if isinstance(node, str) and leaf_key == "data":
-            dec = try_decode_base64_text(node)
-            if dec is not None:
-                cleaned_dec = detector.redact_text(
-                    dec,
-                    extra_patient_names=extra_pat,
-                    extra_relative_names=extra_rel,
-                    allow_pin_scan=True,
-                    pseudonym=psn if (psn and not psn_injected[0]) else None,
-                    entity_counts=entity_counts,
-                )
-                if psn and psn in cleaned_dec:
-                    psn_injected[0] = True
-                return encode_base64_text(cleaned_dec)
-
-        # Direct identifiers by semantic key
-        if leaf_key in ("uhid", "patient_ref", "hospital_uhid", "reg_no", "mrn"):
-            if str(node).strip():
-                entity_counts["MRN"] = entity_counts.get("MRN", 0) + 1
-                if psn:
-                    psn_injected[0] = True
-                    return psn
-                return "[MRN]"
-            return node
-
-        if leaf_key in ("aadhar_no", "aadhaar", "aadhaar_no"):
-            if node is not None and str(node).strip():
-                entity_counts["AADHAAR"] = entity_counts.get("AADHAAR", 0) + 1
-                return "[AADHAAR]"
-            return node
-
-        if leaf_key in ("abha", "abha_no", "abha_number", "abha_address"):
-            if node is not None and str(node).strip():
-                etype = "ABHA_ADDRESS" if "address" in leaf_key else "ABHA_NUMBER"
-                entity_counts[etype] = entity_counts.get(etype, 0) + 1
-                return f"[{etype}]"
-            return node
-
-        if leaf_key in ("mobile", "phone", "callback"):
-            if node is not None and str(node).strip():
-                entity_counts["PHONE"] = entity_counts.get("PHONE", 0) + 1
-                return "[PHONE]"
-            return node
-
-        if leaf_key == "email":
-            if node is not None and str(node).strip():
-                entity_counts["EMAIL"] = entity_counts.get("EMAIL", 0) + 1
-                return "[EMAIL]"
-            return node
-
-        if leaf_key in ("patient_name",) or (leaf_key == "name" and parent_key in ("patient", "raised_by")):
-            if isinstance(node, str) and node.strip():
-                entity_counts["PATIENT_NAME"] = entity_counts.get("PATIENT_NAME", 0) + 1
-                if psn and not psn_injected[0]:
-                    psn_injected[0] = True
-                    return psn
-                return "[PATIENT_NAME]"
-            return node
-
-        if parent_key == "name" and leaf_key in ("first", "last", "local"):
-            if isinstance(node, str) and node.strip():
-                entity_counts["PATIENT_NAME"] = entity_counts.get("PATIENT_NAME", 0) + 1
-                if psn and leaf_key == "first" and not psn_injected[0]:
-                    psn_injected[0] = True
-                    return psn
-                return "[PATIENT_NAME]"
-            return node
-
-        if parent_key == "guardian" and leaf_key == "name":
-            if isinstance(node, str) and node.strip():
-                entity_counts["RELATIVE_NAME"] = entity_counts.get("RELATIVE_NAME", 0) + 1
-                return "[RELATIVE_NAME]"
-            return node
-
-        if leaf_key == "dob":
-            if node is not None and str(node).strip():
-                entity_counts["DOB"] = entity_counts.get("DOB", 0) + 1
-                gen_flag[0] = True
-                return "[DOB]"
-            return node
-
-        if leaf_key == "age" and prof is not None:
-            a, _ = parse_age_val(node)
-            if a is not None:
-                gen_flag[0] = True
-                return format_age_band(a, prof)
-            return node
-
-        if leaf_key == "age_sex" and prof is not None:
-            a, g = parse_age_val(node)
-            if a is not None:
-                gen_flag[0] = True
-                band = format_age_band(a, prof)
-                return f"{band}/{g}" if g else band
-            return node
-
-        if leaf_key in ("village", "city"):
-            if isinstance(node, str) and node.strip():
-                entity_counts["VILLAGE"] = entity_counts.get("VILLAGE", 0) + 1
-                gen_flag[0] = True
-                return "[VILLAGE]"
-            return node
-
-        if leaf_key == "tehsil":
-            if isinstance(node, str) and node.strip():
-                gen_flag[0] = True
-                return "[TEHSIL]"
-            return node
-
-        if leaf_key == "district" and prof is not None:
-            if prof.generalize_district and isinstance(node, str) and node.strip():
-                gen_flag[0] = True
-                return prof.state_label
-            return node
-
-        if leaf_key in ("pin", "postalcode") and prof is not None:
-            if isinstance(node, str) and node.strip():
-                entity_counts["PIN"] = entity_counts.get("PIN", 0) + 1
-                gen_flag[0] = True
-                return format_pin_generalized(node, prof)
-            return node
-
-        if leaf_key in ("visit_date", "collected", "date", "registered_on") and prof is not None:
-            if isinstance(node, str) and node.strip():
-                shifted, _ = shift_date_value(node, date_hint, prof.date_shift, modal_year)
-                return shifted
-            return node
-
-        if leaf_key in ("doctor", "referred_by"):
-            return node
-
-        if isinstance(node, str):
-            # Free text fields (line, notes, remarks, address_note, reviewed_by, etc.)
-            cleaned = detector.redact_text(
-                node,
-                extra_patient_names=extra_pat,
-                extra_relative_names=extra_rel,
-                allow_pin_scan=(leaf_key in ("line", "address", "address_note")),
-                entity_counts=entity_counts,
-            )
-            if leaf_key in ("line", "address", "address_note") and prof and prof.generalize_district and rc and rc.district:
-                cleaned = re.sub(re.escape(rc.district), prof.state_label, cleaned, flags=re.I)
-            return cleaned
-
-        return node
+    str_spans_cache: dict[tuple[str, bool], list[Any]] = {}
 
     if is_doc or is_non_patient_misc:
         loc = "doc"
@@ -792,7 +901,10 @@ def _sanitize_json(
         prof = unit_profiles.get(uid)
         psn_inj = [False]
         gen_flag = [False]
-        cleaned = _clean_node(data, [], rc, psn, prof, psn_inj, gen_flag)
+        cleaned = _clean_json_node(
+            data, [], rc, psn, prof, psn_inj, gen_flag,
+            date_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_spans_cache,
+        )
         if gen_flag[0]:
             stats["records_generalized"] = stats.get("records_generalized", 0) + 1
         records_out.append({
@@ -804,7 +916,6 @@ def _sanitize_json(
         return json.dumps(cleaned, ensure_ascii=False, indent=2) + "\n"
 
     # List-of-dicts JSON (visits / patients / results)
-    # First sanitize metadata keys cleanly
     used_top: set[str] = set()
     cleaned_root: dict[str, Any] = {}
     for k, v in data.items():
@@ -812,30 +923,32 @@ def _sanitize_json(
         used_top.add(sk)
         if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
             pkey = k.replace("~", "~0").replace("/", "~1")
-            out_list = []
-            for i, item in enumerate(v):
-                loc = f"/{pkey}/{i}"
-                rc = clues_by_loc.get(loc)
-                uid = rc.unit_id if rc else f"{rel}|{loc}"
-                psn = unit_to_psn.get(uid)
-                prof = unit_profiles.get(uid)
-                psn_inj = [False]
-                gen_flag = [False]
-                c_item = _clean_node(item, [str(k).lower()], rc, psn, prof, psn_inj, gen_flag)
-                if psn and not psn_inj[0] and isinstance(c_item, dict):
-                    c_item["patient_ref"] = psn
-                out_list.append(c_item)
-                if gen_flag[0]:
-                    stats["records_generalized"] = stats.get("records_generalized", 0) + 1
-                records_out.append({
-                    "file": f"sanitized/{rel}",
-                    "loc": loc,
-                    "patient": psn,
-                    **({"status": "generalized"} if gen_flag[0] else {}),
-                })
+            out_list, chunk_recs, chunk_counts, chunk_gen = sanitize_json_list_chunk(
+                rel_path=rel,
+                root_key=str(k),
+                pkey=pkey,
+                items_chunk=v,
+                start_idx=0,
+                date_hint=date_hint,
+                modal_year=modal_year,
+                clues_by_loc=clues_by_loc,
+                unit_to_psn=unit_to_psn,
+                unit_profiles=unit_profiles,
+                ref_lookup=ref_lookup,
+                detector=detector,
+                keyring=keyring,
+            )
+            for ek, ev in chunk_counts.items():
+                entity_counts[ek] = entity_counts.get(ek, 0) + ev
+            if chunk_gen:
+                stats["records_generalized"] = stats.get("records_generalized", 0) + chunk_gen
+            records_out.extend(chunk_recs)
             cleaned_root[sk] = out_list
         else:
-            cleaned_root[sk] = _clean_node(v, [str(k).lower()], None, None, None, [False], [False])
+            cleaned_root[sk] = _clean_json_node(
+                v, [str(k).lower()], None, None, None, [False], [False],
+                date_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_spans_cache,
+            )
 
     return json.dumps(cleaned_root, ensure_ascii=False, indent=2) + "\n"
 
@@ -1039,6 +1152,113 @@ _RX_TEXT_WA_TS = re.compile(r"^(\[)(\d{1,2}/\d{1,2}/\d{2,4})(,\s*[^\]]+\])")
 _RX_TEXT_NURSE_TS = re.compile(r"(?m)^(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})(\s+\d{1,2}:\d{2}\b)")
 
 
+def preprocess_text_doc(
+    text: str,
+    date_hint: str,
+    modal_year: int,
+    prof: PrivacyProfile | None,
+    entity_counts: dict[str, int],
+) -> tuple[str, bool]:
+    """Apply DOB suppression, date shifting, and age banding before PII redaction."""
+    generalized_any = False
+
+    def _dob_sub(m: re.Match) -> str:
+        nonlocal generalized_any
+        entity_counts["DOB"] = entity_counts.get("DOB", 0) + 1
+        generalized_any = True
+        return f"{m.group(1)}[DOB]"
+
+    work = _RX_TEXT_DOB_LINE.sub(_dob_sub, text)
+
+    if prof:
+        def _date_line_sub(m: re.Match) -> str:
+            val_orig = m.group(2).strip()
+            shifted, ok = shift_date_value(val_orig, date_hint, prof.date_shift, modal_year)
+            return m.group(1) + (shifted if ok else val_orig)
+
+        work = _RX_TEXT_DATE_LINE.sub(_date_line_sub, work)
+        work = _RX_TEXT_WA_TS.sub(
+            lambda m: m.group(1) + shift_date_value(m.group(2), "dmy", prof.date_shift, modal_year)[0] + m.group(3),
+            work,
+        )
+        work = _RX_TEXT_NURSE_TS.sub(
+            lambda m: shift_date_value(m.group(1), date_hint, prof.date_shift, modal_year)[0] + m.group(2),
+            work,
+        )
+
+        def _age_sub(m: re.Match) -> str:
+            nonlocal generalized_any
+            age_val = int(to_ascii_digits(m.group(2)))
+            generalized_any = True
+            return f"{m.group(1)}{format_age_band(age_val, prof)}{m.group(3)}"
+
+        work = _RX_TEXT_AGE.sub(_age_sub, work)
+        work = _RX_TEXT_AGE_INLINE.sub(
+            lambda m: (lambda b: f"{b}{m.group(2)}")(format_age_band(int(to_ascii_digits(m.group(1))), prof)),
+            work,
+        )
+        if _RX_TEXT_AGE_INLINE.search(text):
+            generalized_any = True
+
+    return work, generalized_any
+
+
+def redact_text_chunk(
+    chunk: str,
+    extra_pat: list[str],
+    extra_rel: list[str],
+    pseudonym: str | None,
+    detector: PIIDetector,
+) -> tuple[str, dict[str, int]]:
+    """Redact one chunk of plain text and return (cleaned_chunk, chunk_entity_counts)."""
+    counts: dict[str, int] = {}
+    cleaned = detector.redact_text(
+        chunk,
+        extra_patient_names=extra_pat,
+        extra_relative_names=extra_rel,
+        allow_pin_scan=True,
+        pseudonym=pseudonym,
+        entity_counts=counts,
+    )
+    return cleaned, counts
+
+
+def finalize_text_doc(
+    cleaned: str,
+    rel: str,
+    rc: RecordClues | None,
+    psn: str | None,
+    prof: PrivacyProfile | None,
+    generalized_any: bool,
+    stats: dict[str, int],
+    records_out: list[dict[str, Any]],
+) -> str:
+    """Apply district/PIN generalization and record accounting for a plain-text document."""
+    if prof and prof.generalize_district and rc:
+        for d_name in ([rc.district] if rc.district else []):
+            cleaned = re.sub(re.escape(d_name), prof.state_label, cleaned, flags=re.I)
+        cleaned = re.sub(
+            r"(?im)^([^\n]*(?:Hospital|Sadan)[^\n]*,\s*)([A-Za-z ]{3,25})$",
+            rf"\g<1>{prof.state_label}",
+            cleaned,
+        )
+        cleaned = re.sub(r"([1-8]\d{2})\*{3}", "******", cleaned)
+        generalized_any = True
+
+    if psn and psn not in cleaned:
+        cleaned = f"Patient: {psn}\n" + cleaned
+
+    if generalized_any:
+        stats["records_generalized"] = stats.get("records_generalized", 0) + 1
+    records_out.append({
+        "file": f"sanitized/{rel}",
+        "loc": "doc",
+        "patient": psn,
+        **({"status": "generalized"} if generalized_any else {}),
+    })
+    return cleaned
+
+
 def _sanitize_text_doc(
     inf: IngestedFile,
     date_hint: str,
@@ -1060,87 +1280,31 @@ def _sanitize_text_doc(
     extra_pat = rc.patient_names if rc else []
     extra_rel = rc.relative_names if rc else []
 
-    # Check if purely clean clinical reference document (zero PII entities anywhere)
-    initial_spans = detector.detect_text(text, allow_pin_scan=False)
-    if (not rc or not rc.is_patient_record) and not initial_spans:
+    if (not rc or not rc.is_patient_record) and not detector.detect_text(text, allow_pin_scan=False):
         records_out.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": None})
         return text
 
-    generalized_any = False
+    work, generalized_any = preprocess_text_doc(text, date_hint, modal_year, prof, entity_counts)
 
-    # 1. Suppress DOB lines before general date shifting
-    def _dob_sub(m: re.Match) -> str:
-        nonlocal generalized_any
-        entity_counts["DOB"] = entity_counts.get("DOB", 0) + 1
-        generalized_any = True
-        return f"{m.group(1)}[DOB]"
-
-    work = _RX_TEXT_DOB_LINE.sub(_dob_sub, text)
-
-    # 2. Shift dates if profile exists
-    if prof:
-        def _date_line_sub(m: re.Match) -> str:
-            val_orig = m.group(2).strip()
-            shifted, ok = shift_date_value(val_orig, date_hint, prof.date_shift, modal_year)
-            return m.group(1) + (shifted if ok else val_orig)
-
-        work = _RX_TEXT_DATE_LINE.sub(_date_line_sub, work)
-        work = _RX_TEXT_WA_TS.sub(
-            lambda m: m.group(1) + shift_date_value(m.group(2), "dmy", prof.date_shift, modal_year)[0] + m.group(3),
+    if len(work) <= 100_000:
+        cleaned = detector.redact_text(
             work,
+            extra_patient_names=extra_pat,
+            extra_relative_names=extra_rel,
+            allow_pin_scan=True,
+            pseudonym=psn,
+            entity_counts=entity_counts,
         )
-        work = _RX_TEXT_NURSE_TS.sub(
-            lambda m: shift_date_value(m.group(1), date_hint, prof.date_shift, modal_year)[0] + m.group(2),
-            work,
-        )
+    else:
+        cleaned_parts: list[str] = []
+        psn_left = psn
+        for chunk in split_text_chunks(work):
+            c_out, c_counts = redact_text_chunk(chunk, extra_pat, extra_rel, psn_left, detector)
+            for k, v in c_counts.items():
+                entity_counts[k] = entity_counts.get(k, 0) + v
+            if psn_left and psn_left in c_out:
+                psn_left = None
+            cleaned_parts.append(c_out)
+        cleaned = "".join(cleaned_parts)
 
-        # 3. Age banding (preserving gender & unit suffix, never touching durations)
-        def _age_sub(m: re.Match) -> str:
-            nonlocal generalized_any
-            age_val = int(to_ascii_digits(m.group(2)))
-            generalized_any = True
-            return f"{m.group(1)}{format_age_band(age_val, prof)}{m.group(3)}"
-
-        work = _RX_TEXT_AGE.sub(_age_sub, work)
-        work = _RX_TEXT_AGE_INLINE.sub(
-            lambda m: (lambda b: f"{b}{m.group(2)}")(format_age_band(int(to_ascii_digits(m.group(1))), prof)),
-            work,
-        )
-        if _RX_TEXT_AGE_INLINE.search(text):
-            generalized_any = True
-
-    # 4. Run full multilingual PII redaction (injecting PSN-XXXXXX if linked)
-    cleaned = detector.redact_text(
-        work,
-        extra_patient_names=extra_pat,
-        extra_relative_names=extra_rel,
-        allow_pin_scan=True,
-        pseudonym=psn,
-        entity_counts=entity_counts,
-    )
-
-    # 5. District & PIN generalization inside text if elevated risk (including hospital header line ", Barabanki")
-    if prof and prof.generalize_district and rc:
-        for d_name in ([rc.district] if rc.district else []):
-            cleaned = re.sub(re.escape(d_name), prof.state_label, cleaned, flags=re.I)
-        cleaned = re.sub(
-            r"(?im)^([^\n]*(?:Hospital|Sadan)[^\n]*,\s*)([A-Za-z ]{3,25})$",
-            rf"\g<1>{prof.state_label}",
-            cleaned,
-        )
-        cleaned = re.sub(r"([1-8]\d{2})\*{3}", "******", cleaned)
-        generalized_any = True
-
-    # Guarantee pseudonym is physically present inside linked patient document
-    if psn and psn not in cleaned:
-        cleaned = f"Patient: {psn}\n" + cleaned
-
-    if generalized_any:
-        stats["records_generalized"] = stats.get("records_generalized", 0) + 1
-    records_out.append({
-        "file": f"sanitized/{rel}",
-        "loc": "doc",
-        "patient": psn,
-        **({"status": "generalized"} if generalized_any else {}),
-    })
-    return cleaned
+    return finalize_text_doc(cleaned, rel, rc, psn, prof, generalized_any, stats, records_out)

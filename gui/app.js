@@ -229,7 +229,9 @@ function renderFilesTable() {
     return;
   }
 
-  tbody.innerHTML = rows.map((f, idx) => {
+  const MAX_ROWS = 200;
+  const shown = rows.slice(0, MAX_ROWS);
+  tbody.innerHTML = shown.map((f, idx) => {
     const isSan = f.status === "sanitized";
     const badge = isSan ? `<span class="badge badge-ok">sanitized</span>` : `<span class="badge badge-warn">quarantined</span>`;
     const action = isSan
@@ -245,7 +247,7 @@ function renderFilesTable() {
         <td>${action}</td>
       </tr>
     `;
-  }).join("");
+  }).join("") + (rows.length > MAX_ROWS ? `<tr><td colspan="6" class="hint">Showing first ${MAX_ROWS} of ${rows.length} matching files. Use search to narrow results.</td></tr>` : "");
 
   tbody.querySelectorAll(".inspect-btn").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -263,7 +265,8 @@ function renderClusters() {
     !q || c.patient.toLowerCase().includes(q) || c.files.some(f => f.toLowerCase().includes(q))
   );
   document.getElementById("cluster-summary-bar").innerHTML =
-    `<strong>${data.cluster_count}</strong> distinct pseudonym clusters &middot; <strong>${data.total_records - data.unlinked_count}</strong> linked records &middot; <strong>${data.unlinked_count}</strong> unlinked/null records`;
+    `<strong>${data.cluster_count}</strong> distinct pseudonym clusters &middot; <strong>${data.total_records - data.unlinked_count}</strong> linked records &middot; <strong>${data.unlinked_count}</strong> unlinked/null records`
+    + (data.clusters_truncated ? ` <span class="hint">(showing top ${data.clusters.length})</span>` : "");
 
   const listEl = document.getElementById("cluster-list");
   if (!clusters.length) {
@@ -271,7 +274,9 @@ function renderClusters() {
     return;
   }
 
-  listEl.innerHTML = clusters.map(c => `
+  const MAX_DOM_CLUSTERS = 200;
+  const shownClusters = clusters.slice(0, MAX_DOM_CLUSTERS);
+  listEl.innerHTML = shownClusters.map(c => `
     <div class="cluster-item ${state.selectedCluster === c.patient ? "active" : ""}" data-psn="${esc(c.patient)}">
       <div>
         <div class="mono" style="font-weight:700;color:#0f2942">${esc(c.patient)}</div>
@@ -279,7 +284,7 @@ function renderClusters() {
       </div>
       <span class="badge badge-info">${c.record_count} recs</span>
     </div>
-  `).join("");
+  `).join("") + (clusters.length > MAX_DOM_CLUSTERS ? `<div class="hint" style="padding:8px">Showing first ${MAX_DOM_CLUSTERS} of ${clusters.length} matching clusters.</div>` : "");
 
   listEl.querySelectorAll(".cluster-item").forEach(item => {
     item.addEventListener("click", () => {
@@ -558,24 +563,40 @@ async function runBatchFirewall() {
         return;
       }
       const totalBytes = state.selectedFiles.reduce((acc, f) => acc + (f.file.size || 0), 0);
-      if (totalBytes > 50 * 1024 * 1024) {
+      if (totalBytes > 4 * 1024 * 1024 * 1024) {
         setStages("");
-        showBanner("run-banner", "Selected files exceed the 50 MB browser upload limit; use 'Local Folder Path' for huge directories.", false);
+        showBanner("run-banner", "Selected files exceed the 4 GB upload limit; use 'Local Folder Path' for larger directories.", false);
         return;
       }
       state.uploadedRawBySha = {};
-      const payloadFiles = [];
-      for (const item of state.selectedFiles) {
-        const buf = await item.file.arrayBuffer();
-        const hex = await sha256Hex(buf);
-        if (hex) state.uploadedRawBySha[hex] = new Uint8Array(buf);
-        payloadFiles.push({
-          rel_path: item.rel_path,
-          content_b64: arrayBufferToBase64(buf),
-        });
+      const startRes = await apiPost("/api/stage-start", {});
+      if (!startRes.ok || !startRes.stage_id) {
+        setStages("");
+        showBanner("run-banner", startRes.error || "Failed to initialize upload staging.", false);
+        return;
       }
-      data = await apiPost("/api/run-upload", {
-        files: payloadFiles,
+      const stageId = startRes.stage_id;
+      for (const item of state.selectedFiles) {
+        if ((item.file.size || 0) <= 2 * 1024 * 1024) {
+          const buf = await item.file.arrayBuffer();
+          const hex = await sha256Hex(buf);
+          if (hex) state.uploadedRawBySha[hex] = new Uint8Array(buf);
+        }
+        const upUrl = `/api/stage-file?stage_id=${encodeURIComponent(stageId)}&rel_path=${encodeURIComponent(item.rel_path)}`;
+        const upRes = await fetch(upUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: item.file,
+        });
+        const upJson = await parseApiResponse(upRes, upUrl);
+        if (!upJson.ok) {
+          setStages("");
+          showBanner("run-banner", upJson.error || `Failed uploading ${item.rel_path}`, false);
+          return;
+        }
+      }
+      data = await apiPost("/api/run-staged", {
+        stage_id: stageId,
         output_dir: outDir,
         secret,
         policy_overrides: policyOverrides,

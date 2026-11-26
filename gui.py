@@ -7,17 +7,20 @@ import base64
 import binascii
 import csv
 import hashlib
+import heapq
 import http.server
 import io
 import json
 import mimetypes
 import os
 import secrets
+import shutil
 import socket
 import socketserver
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
 import webbrowser
 import zipfile
@@ -38,6 +41,10 @@ GUI_DIR = REPO_ROOT / "gui"
 POLICY_PATH = REPO_ROOT / "config" / "policy.yaml"
 TOOLKIT_DIR = REPO_ROOT.parent / "Secret-Wards-ToolKit"
 _AUTO_SESSION_KEY = os.environ.get("RAKSHA_SECRET") or secrets.token_hex(32)
+_STAGING_LOCK = threading.Lock()
+_STAGING_DIRS: dict[str, Path] = {}
+MAX_UI_CLUSTERS = 500
+MAX_STAGED_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
 
 
 def _load_policy_dict() -> dict[str, Any]:
@@ -147,7 +154,7 @@ def _run_pipeline_subprocess(
             env=env,
             capture_output=True,
             text=True,
-            timeout=900,
+            timeout=3600,
         )
 
     if proc.returncode != 0:
@@ -171,43 +178,57 @@ def _summarize_output(output_dir: Path) -> dict[str, Any]:
         return {"exists": False}
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    clusters: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    unlinked: list[dict[str, Any]] = []
+    cluster_counts: dict[str, int] = defaultdict(int)
+    cluster_files: dict[str, set[str]] = defaultdict(set)
+    cluster_recs: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    unlinked_count = 0
+    unlinked_sample: list[dict[str, Any]] = []
     total_records = 0
 
     if records_path.is_file():
-        for line in records_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            total_records += 1
-            psn = rec.get("patient")
-            if psn:
-                clusters[psn].append(rec)
-            else:
-                unlinked.append(rec)
+        with records_path.open("r", encoding="utf-8") as f_rec:
+            for line in f_rec:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                total_records += 1
+                psn = rec.get("patient")
+                if psn:
+                    cluster_counts[psn] += 1
+                    fset = cluster_files[psn]
+                    if len(fset) < 12:
+                        fset.add(rec["file"])
+                    rlist = cluster_recs[psn]
+                    if len(rlist) < 50:
+                        rlist.append(rec)
+                else:
+                    unlinked_count += 1
+                    if len(unlinked_sample) < 50:
+                        unlinked_sample.append(rec)
 
+    top_psns = heapq.nsmallest(MAX_UI_CLUSTERS, cluster_counts.keys(), key=lambda p: (-cluster_counts[p], p))
     cluster_list = []
-    for psn in sorted(clusters, key=lambda p: (-len(clusters[p]), p)):
-        items = clusters[psn]
-        files_touched = sorted({it["file"] for it in items})
+    for psn in top_psns:
+        files_touched = sorted(cluster_files[psn])
         cluster_list.append({
             "patient": psn,
-            "record_count": len(items),
+            "record_count": cluster_counts[psn],
             "file_count": len(files_touched),
             "files": files_touched[:12],
-            "records": items[:50],
+            "records": cluster_recs[psn][:50],
         })
 
     return {
         "exists": True,
         "output_dir": str(output_dir),
         "report": report,
-        "cluster_count": len(cluster_list),
-        "unlinked_count": len(unlinked),
+        "cluster_count": len(cluster_counts),
+        "clusters_truncated": len(cluster_counts) > MAX_UI_CLUSTERS,
+        "unlinked_count": unlinked_count,
         "total_records": total_records,
         "clusters": cluster_list,
-        "unlinked_sample": unlinked[:50],
+        "unlinked_sample": unlinked_sample,
     }
 
 
@@ -369,7 +390,7 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
                 "ok": True,
                 "offline": True,
                 "repo": str(REPO_ROOT),
-                "capabilities": ["run", "run-upload", "download-zip", "sandbox", "verify"],
+                "capabilities": ["run", "run-upload", "run-staged", "download-zip", "sandbox", "verify"],
             })
             return
 
@@ -425,13 +446,21 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
                 inp_dir = Path(inp_dir_str).expanduser().resolve()
                 if inp_dir.is_dir():
                     for cand in sorted(p for p in inp_dir.rglob("*") if p.is_file()):
-                        raw_bytes = cand.read_bytes()
-                        if hashlib.sha256(raw_bytes).hexdigest() == sha:
+                        h = hashlib.sha256()
+                        with cand.open("rb") as f_c:
+                            while True:
+                                chk = f_c.read(4194304)
+                                if not chk:
+                                    break
+                                h.update(chk)
+                        if h.hexdigest() == sha:
                             raw_rel = cand.relative_to(inp_dir).as_posix()
-                            if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
-                                raw_content = raw_bytes.decode("utf-16", errors="replace")[:200000]
+                            with cand.open("rb") as f_c:
+                                head_bytes = f_c.read(400000)
+                            if head_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+                                raw_content = head_bytes.decode("utf-16", errors="replace")[:200000]
                             else:
-                                raw_content = raw_bytes.decode("utf-8", errors="replace")[:200000]
+                                raw_content = head_bytes.decode("utf-8", errors="replace")[:200000]
                             break
 
             # Parse CSV preview rows when applicable
@@ -462,26 +491,32 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "No sanitized release found in output_dir."}, status=404)
                 return
 
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                san_root = out_dir / "sanitized"
-                if san_root.is_dir():
-                    for fpath in sorted(p for p in san_root.rglob("*") if p.is_file()):
-                        zf.write(fpath, arcname=fpath.relative_to(out_dir).as_posix())
-                for meta_name in ("report.json", "records.jsonl"):
-                    meta_path = out_dir / meta_name
-                    if meta_path.is_file():
-                        zf.write(meta_path, arcname=meta_name)
+            with tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024) as tmp_zip:
+                with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    san_root = out_dir / "sanitized"
+                    if san_root.is_dir():
+                        for fpath in sorted(p for p in san_root.rglob("*") if p.is_file()):
+                            zf.write(fpath, arcname=fpath.relative_to(out_dir).as_posix())
+                    for meta_name in ("report.json", "records.jsonl"):
+                        meta_path = out_dir / meta_name
+                        if meta_path.is_file():
+                            zf.write(meta_path, arcname=meta_name)
 
-            data = buf.getvalue()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", 'attachment; filename="raksha-sanitized-release.zip"')
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            self.wfile.write(data)
+                tmp_zip.seek(0, os.SEEK_END)
+                zip_len = tmp_zip.tell()
+                tmp_zip.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="raksha-sanitized-release.zip"')
+                self.send_header("Content-Length", str(zip_len))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                while True:
+                    chunk = tmp_zip.read(1048576)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
             return
 
         if path.startswith("/api/"):
@@ -492,11 +527,84 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/api/stage-file":
+            stage_id = qs.get("stage_id", [""])[0].strip()
+            rel_raw = qs.get("rel_path", [""])[0]
+            with _STAGING_LOCK:
+                stage_dir = _STAGING_DIRS.get(stage_id)
+            if stage_dir is None or not stage_dir.is_dir():
+                self._send_json({"error": "Invalid or expired upload staging session."}, status=400)
+                return
+            safe_rel = _safe_rel_upload_path(rel_raw)
+            if safe_rel is None:
+                self._send_json({"error": f"Unsafe or invalid relative file path: {rel_raw!r}"}, status=400)
+                return
+            dest = (stage_dir / safe_rel).resolve()
+            if not dest.is_relative_to(stage_dir.resolve()):
+                self._send_json({"error": "Path escapes staging boundary."}, status=400)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_STAGED_UPLOAD_BYTES:
+                self._send_json({"error": "Invalid or oversized Content-Length."}, status=400)
+                return
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            remaining = length
+            with dest.open("wb") as f_out:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1048576, remaining))
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+                    remaining -= len(chunk)
+            if remaining != 0:
+                dest.unlink(missing_ok=True)
+                self._send_json({"error": "Incomplete file stream received."}, status=400)
+                return
+            self._send_json({"ok": True, "bytes": length})
+            return
+
         max_body = 64 * 1024 * 1024 if path == "/api/run-upload" else 5 * 1024 * 1024
         try:
             body = self._read_json_body(max_bytes=max_body)
         except ValueError as exc:
             self._send_json({"error": f"Invalid JSON payload: {exc}"}, status=400)
+            return
+
+        if path == "/api/stage-start":
+            stage_id = secrets.token_hex(16)
+            stage_dir = Path(tempfile.mkdtemp(prefix="raksha-gui-stage-")).resolve()
+            with _STAGING_LOCK:
+                _STAGING_DIRS[stage_id] = stage_dir
+            self._send_json({"ok": True, "stage_id": stage_id})
+            return
+
+        if path == "/api/run-staged":
+            stage_id = str(body.get("stage_id", "")).strip()
+            out_str = str(body.get("output_dir", "")).strip()
+            secret = str(body.get("secret", ""))
+            overrides = body.get("policy_overrides") or {}
+            with _STAGING_LOCK:
+                stage_dir = _STAGING_DIRS.pop(stage_id, None)
+            if stage_dir is None or not stage_dir.is_dir():
+                self._send_json({"error": "Invalid or expired upload staging session."}, status=400)
+                return
+            try:
+                if not out_str:
+                    self._send_json({"error": "Output Release Directory is required."}, status=400)
+                    return
+                out_dir = Path(out_str).expanduser().resolve()
+                if out_dir == stage_dir or out_dir.is_relative_to(stage_dir):
+                    self._send_json({"error": "Invalid output directory."}, status=400)
+                    return
+                status, payload = _run_pipeline_subprocess(stage_dir, out_dir, secret, overrides)
+                self._send_json(payload, status=status)
+            finally:
+                shutil.rmtree(stage_dir, ignore_errors=True)
             return
 
         if path == "/api/policy":

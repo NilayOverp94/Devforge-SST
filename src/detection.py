@@ -6,6 +6,7 @@ import binascii
 import json
 import re as std_re
 import unicodedata
+from bisect import bisect_left
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -605,6 +606,66 @@ _RX_TEHSIL_TEXT = regex.compile(
 _RX_PIN_ADDR = regex.compile(r"(?<!\d)([1-8]\d{5})(?!\d)")
 
 
+class _IntervalSet:
+    """Fast O(log M) interval overlap checker with lazy batch merging."""
+
+    __slots__ = ("_starts", "_ends", "_pending")
+
+    def __init__(self, intervals: list[tuple[int, int]] | None = None) -> None:
+        self._starts: list[int] = []
+        self._ends: list[int] = []
+        self._pending: list[tuple[int, int]] = []
+        if intervals:
+            self._rebuild(intervals)
+
+    def _rebuild(self, intervals: list[tuple[int, int]]) -> None:
+        if not intervals:
+            return
+        s_iv = sorted(intervals)
+        starts = [s_iv[0][0]]
+        ends = [s_iv[0][1]]
+        for s, e in s_iv[1:]:
+            if s <= ends[-1]:
+                if e > ends[-1]:
+                    ends[-1] = e
+            else:
+                starts.append(s)
+                ends.append(e)
+        self._starts = starts
+        self._ends = ends
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        all_iv = list(zip(self._starts, self._ends)) + self._pending
+        self._pending.clear()
+        self._rebuild(all_iv)
+
+    def add(self, start: int, end: int) -> None:
+        if start >= end:
+            return
+        self._pending.append((start, end))
+        if len(self._pending) >= 64:
+            self._flush()
+
+    def extend(self, intervals: list[tuple[int, int]]) -> None:
+        if not intervals:
+            return
+        self._pending.extend(intervals)
+        if len(self._pending) >= 64:
+            self._flush()
+
+    def overlaps(self, start: int, end: int) -> bool:
+        if self._starts:
+            idx = bisect_left(self._starts, end) - 1
+            if idx >= 0 and self._ends[idx] > start:
+                return True
+        for s, e in self._pending:
+            if start < e and end > s:
+                return True
+        return False
+
+
 def _overlaps_any(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     for s, e in spans:
         if start < e and end > s:
@@ -707,6 +768,7 @@ class PIIDetector:
             return []
         shadow = shadow_normalize(text)
         prot = self.protected_spans(text)
+        prot_iv = _IntervalSet(prot)
         spans: list[PIISpan] = []
 
         # 1. Structured numeric & alphanumeric direct identifiers (highest priority - never blocked by lab range guards)
@@ -719,13 +781,13 @@ class PIIDetector:
         for m in _RX_AADHAAR_MASKED.finditer(shadow):
             _add_span(spans, m.start(), m.end(), "AADHAAR_MASKED", text, m.group(0).lower())
 
-        span_ranges = [(s.start, s.end) for s in spans]
+        span_iv = _IntervalSet([(s.start, s.end) for s in spans])
         for m in _RX_AADHAAR.finditer(shadow):
-            if not _overlaps_any(m.start(), m.end(), span_ranges):
+            if not span_iv.overlaps(m.start(), m.end()):
                 prev_len = len(spans)
                 _add_span(spans, m.start(), m.end(), "AADHAAR", text, _RX_DIGITS_ONLY.sub("", m.group(0)))
                 if len(spans) > prev_len:
-                    span_ranges.append((spans[-1].start, spans[-1].end))
+                    span_iv.add(spans[-1].start, spans[-1].end)
 
         for m in _RX_EMAIL.finditer(shadow):
             _add_span(spans, m.start(), m.end(), "EMAIL", text, m.group(0).lower())
@@ -745,21 +807,27 @@ class PIIDetector:
         # Fallback offline libphonenumber matcher for unusual formats (only if >=10 digits exist outside already-matched spans)
         if _RX_HAS_10_DIGITS.search(shadow):
             # Quick check: count digits not already covered by PHONE/AADHAAR/ABHA spans
-            covered = set()
-            for sp in spans:
-                if sp.pii_type in ("PHONE", "AADHAAR", "AADHAAR_MASKED", "ABHA_NUMBER"):
-                    covered.update(range(sp.start, sp.end))
-            uncovered_digits = sum(1 for idx, ch in enumerate(shadow) if ch.isdigit() and idx not in covered)
+            covered_iv = _IntervalSet([
+                (sp.start, sp.end)
+                for sp in spans
+                if sp.pii_type in ("PHONE", "AADHAAR", "AADHAAR_MASKED", "ABHA_NUMBER")
+            ])
+            uncovered_digits = 0
+            for idx, ch in enumerate(shadow):
+                if ch.isdigit() and not covered_iv.overlaps(idx, idx + 1):
+                    uncovered_digits += 1
+                    if uncovered_digits >= 10:
+                        break
             if uncovered_digits >= 10:
                 try:
-                    span_ranges = [(s.start, s.end) for s in spans]
+                    span_iv = _IntervalSet([(s.start, s.end) for s in spans])
                     for match in phonenumbers.PhoneNumberMatcher(shadow, "IN"):
                         digits = _RX_DIGITS_ONLY.sub("", match.raw_string)
-                        if len(digits) >= 10 and not _overlaps_any(match.start, match.end, span_ranges):
+                        if len(digits) >= 10 and not span_iv.overlaps(match.start, match.end):
                             prev_len = len(spans)
                             _add_span(spans, match.start, match.end, "PHONE", text, digits[-10:])
                             if len(spans) > prev_len:
-                                span_ranges.append((spans[-1].start, spans[-1].end))
+                                span_iv.add(spans[-1].start, spans[-1].end)
                 except Exception:
                     pass
 
@@ -778,7 +846,7 @@ class PIIDetector:
 
         for m in _RX_ADDR_WARD.finditer(shadow):
             # Only treat Ward N as LOCALITY when NOT inside hospital-ward protected spans
-            if not _overlaps_any(m.start(), m.end(), prot):
+            if not prot_iv.overlaps(m.start(), m.end()):
                 # Check if line looks like clinical ward header vs address/locality
                 line_start = text.rfind("\n", 0, m.start()) + 1
                 line_end = text.find("\n", m.end())
@@ -792,16 +860,23 @@ class PIIDetector:
         for m in _RX_VILLAGE_TEXT.finditer(text):
             _add_span(spans, m.start(), m.end(), "VILLAGE", text)
 
+        span_iv_vill = None
         for m in _RX_VILLAGE_BEFORE_TEHSIL.finditer(text):
-            if not _overlaps_any(m.start(), m.end(), prot) and not _overlaps_any(m.start(), m.end(), [(s.start, s.end) for s in spans]):
-                _add_span(spans, m.start(), m.end(), "VILLAGE", text)
+            if not prot_iv.overlaps(m.start(), m.end()):
+                if span_iv_vill is None:
+                    span_iv_vill = _IntervalSet([(s.start, s.end) for s in spans])
+                if not span_iv_vill.overlaps(m.start(), m.end()):
+                    prev_len = len(spans)
+                    _add_span(spans, m.start(), m.end(), "VILLAGE", text)
+                    if len(spans) > prev_len:
+                        span_iv_vill.add(spans[-1].start, spans[-1].end)
 
         for m in _RX_TEHSIL_TEXT.finditer(text):
             _add_span(spans, m.start(), m.end(), "TEHSIL", text)
 
         if allow_pin_scan:
             for m in _RX_PIN_ADDR.finditer(shadow):
-                if not _overlaps_any(m.start(), m.end(), prot):
+                if not prot_iv.overlaps(m.start(), m.end()):
                     # Verify PIN context (near Distt/Tehsil/PIN/Pin Code/-) or not a lab count/amount
                     ctx = shadow[max(0, m.start() - 45):min(len(shadow), m.end() + 25)].lower()
                     if any(k in ctx for k in ("pin", "zip", "distt", "district", "जिला", "तहसील", "tehsil", "uttar pradesh", "- " + m.group(1), ", " + m.group(1))):
@@ -810,25 +885,25 @@ class PIIDetector:
 
         # 3. Context-anchored person & relative names
         for m in _RX_FRAG_REL.finditer(text):
-            if not _overlaps_any(m.start(1), m.end(1), prot) and not _is_non_pii_phrase(m.group(1)):
+            if not prot_iv.overlaps(m.start(1), m.end(1)) and not _is_non_pii_phrase(m.group(1)):
                 _add_span(spans, m.start(1), m.end(1), "PATIENT_NAME", text, role="patient")
-            if not _overlaps_any(m.start(2), m.end(2), prot) and not _is_non_pii_phrase(m.group(2)):
+            if not prot_iv.overlaps(m.start(2), m.end(2)) and not _is_non_pii_phrase(m.group(2)):
                 _add_span(spans, m.start(2), m.end(2), "RELATIVE_NAME", text, role="relative")
 
         for m in _RX_PATIENT_LABEL.finditer(text):
-            if not _overlaps_any(m.start(), m.end(), prot) and not _is_non_pii_phrase(m.group(0)):
+            if not prot_iv.overlaps(m.start(), m.end()) and not _is_non_pii_phrase(m.group(0)):
                 _add_span(spans, m.start(), m.end(), "PATIENT_NAME", text, role="patient")
 
         for m in _RX_INLINE_PATIENT_ANCHOR.finditer(text):
-            if not _overlaps_any(m.start(), m.end(), prot) and not _is_non_pii_phrase(m.group(0)):
+            if not prot_iv.overlaps(m.start(), m.end()) and not _is_non_pii_phrase(m.group(0)):
                 _add_span(spans, m.start(), m.end(), "PATIENT_NAME", text, role="patient")
 
         for m in _RX_REL_LABEL.finditer(text):
-            if not _overlaps_any(m.start(), m.end(), prot) and not _is_non_pii_phrase(m.group(0)):
+            if not prot_iv.overlaps(m.start(), m.end()) and not _is_non_pii_phrase(m.group(0)):
                 _add_span(spans, m.start(), m.end(), "RELATIVE_NAME", text, role="relative")
 
         for m in _RX_CO_CARE_OF.finditer(text):
-            if not _overlaps_any(m.start(), m.end(), prot):
+            if not prot_iv.overlaps(m.start(), m.end()):
                 cand = m.group(1).strip()
                 if not _SYMPTOM_WORDS_RE.match(cand) and not _is_non_pii_phrase(cand):
                     _add_span(spans, m.start(1), m.end(1), "RELATIVE_NAME", text, role="relative")
@@ -839,75 +914,79 @@ class PIIDetector:
                 _add_span(spans, m.start(1), m.end(1), "RELATIVE_NAME", text, role="relative")
 
         for m in _RX_HONORIFIC_NAME.finditer(text):
-            if not _overlaps_any(m.start(), m.end(), prot) and not _is_non_pii_phrase(m.group(1)):
+            if not prot_iv.overlaps(m.start(), m.end()) and not _is_non_pii_phrase(m.group(1)):
                 # Include the honorific or keep only name? Redact full "<Name> ji" to prevent first-name leakage,
                 # or redact group(1) and keep/redact honorific — redacting full span removes "Asha ji" cleanly!
                 role = "relative" if m.group(2).lower() in ("bhaiya", "bhaiyya", "chachu", "chacha", "mama", "papa") else "patient"
                 _add_span(spans, m.start(), m.end(), "RELATIVE_NAME" if role == "relative" else "PATIENT_NAME", text, role=role)
 
         for m in _RX_PREFIX_HONORIFIC_NAME.finditer(text):
-            if not _overlaps_any(m.start(1), m.end(1), prot) and not _is_non_pii_phrase(m.group(1)):
+            if not prot_iv.overlaps(m.start(1), m.end(1)) and not _is_non_pii_phrase(m.group(1)):
                 _add_span(spans, m.start(1), m.end(1), "PATIENT_NAME", text, role="patient")
 
         for m in _RX_DEVA_POSTPOS.finditer(text):
-            if not _overlaps_any(m.start(1), m.end(1), prot) and not _is_non_pii_phrase(m.group(1)):
+            if not prot_iv.overlaps(m.start(1), m.end(1)) and not _is_non_pii_phrase(m.group(1)):
                 _add_span(spans, m.start(1), m.end(1), "PATIENT_NAME", text, role="patient")
 
         for m in _RX_HINGLISH_POSTPOS.finditer(text):
-            if not _overlaps_any(m.start(1), m.end(1), prot) and not _is_non_pii_phrase(m.group(1)):
+            if not prot_iv.overlaps(m.start(1), m.end(1)) and not _is_non_pii_phrase(m.group(1)):
                 _add_span(spans, m.start(1), m.end(1), "PATIENT_NAME", text, role="patient")
 
         for m in _RX_ATTENDANT_CONTEXT.finditer(text):
-            if not _overlaps_any(m.start(1), m.end(1), prot) and not _is_non_pii_phrase(m.group(1)):
+            if not prot_iv.overlaps(m.start(1), m.end(1)) and not _is_non_pii_phrase(m.group(1)):
                 _add_span(spans, m.start(1), m.end(1), "PATIENT_NAME", text, role="patient")
 
         for m in _RX_PAREN_ATTENDANT.finditer(text):
-            if not _overlaps_any(m.start(1), m.end(1), prot) and not _is_non_pii_phrase(m.group(1)):
+            if not prot_iv.overlaps(m.start(1), m.end(1)) and not _is_non_pii_phrase(m.group(1)):
                 _add_span(spans, m.start(1), m.end(1), "PATIENT_NAME", text, role="patient")
 
         # 4. General Classical ML + Gazetteer sweep for un-anchored 2-3 word names & canaries
-        occupied = prot + [(s.start, s.end) for s in spans]
+        occ_iv = _IntervalSet(prot + [(s.start, s.end) for s in spans])
         for cand_rx in _CAND_RX_LIST:
             for m in cand_rx.finditer(text):
-                if _overlaps_any(m.start(), m.end(), occupied):
+                if occ_iv.overlaps(m.start(), m.end()):
                     continue
                 cand = m.group(0)
                 lctx = text[max(0, m.start() - 25):m.start()]
                 rctx = text[m.end():min(len(text), m.end() + 25)]
                 if self.looks_like_person_name(cand, lctx, rctx):
+                    prev_len = len(spans)
                     _add_span(spans, m.start(), m.end(), "PATIENT_NAME", text, role="patient")
-                    occupied.append((m.start(), m.end()))
+                    if len(spans) > prev_len:
+                        occ_iv.add(spans[-1].start, spans[-1].end)
 
         # 5. Propagate known patient/relative name variants (including phonetic equivalents like Hareesh/Harish)
         if extra_patient_names or extra_relative_names:
             text_lower = text.lower()
-            span_ranges = [(s.start, s.end) for s in spans]
+            span_iv = _IntervalSet([(s.start, s.end) for s in spans])
             for name_list, ptype, role in (
                 (extra_patient_names or (), "PATIENT_NAME", "patient"),
                 (extra_relative_names or (), "RELATIVE_NAME", "relative"),
             ):
                 if not name_list:
                     continue
-                extra_firsts = []
-                for nm in name_list:
+                extra_firsts: list[str] = []
+                seen_toks: set[str] = set()
+                for nm in dict.fromkeys(name_list):
                     for tok in self._expand_name_variants(nm):
                         tl = tok.lower()
-                        if len(tok) < 3 or tl in _NON_PII_WORDS or tl in _GENERIC_NAME_PARTS:
+                        if len(tok) < 3 or tl in _NON_PII_WORDS or tl in _GENERIC_NAME_PARTS or tl in seen_toks:
                             continue
+                        seen_toks.add(tl)
                         extra_firsts.append(tok)
                         if tl not in text_lower:
                             continue
                         pat = _compile_token_rx(tok)
                         for m in pat.finditer(text):
-                            if not _overlaps_any(m.start(), m.end(), prot) and not _overlaps_any(m.start(), m.end(), span_ranges):
+                            if not prot_iv.overlaps(m.start(), m.end()) and not span_iv.overlaps(m.start(), m.end()):
                                 prev_len = len(spans)
                                 _add_span(spans, m.start(), m.end(), ptype, text, role=role)
                                 if len(spans) > prev_len:
-                                    span_ranges.append((spans[-1].start, spans[-1].end))
+                                    span_iv.add(spans[-1].start, spans[-1].end)
                 # Phonetic match on capitalized single prose tokens >= 4 chars (catches Harish vs Hareesh, Aneeta vs Anita)
                 if extra_firsts:
                     for m in _RX_CAP_WORD_4.finditer(text):
-                        if _overlaps_any(m.start(), m.end(), prot) or _overlaps_any(m.start(), m.end(), span_ranges):
+                        if prot_iv.overlaps(m.start(), m.end()) or span_iv.overlaps(m.start(), m.end()):
                             continue
                         cand = m.group(0)
                         if cand.lower() in _NON_PII_WORDS:
@@ -916,7 +995,7 @@ class PIIDetector:
                             prev_len = len(spans)
                             _add_span(spans, m.start(), m.end(), ptype, text, role=role)
                             if len(spans) > prev_len:
-                                span_ranges.append((spans[-1].start, spans[-1].end))
+                                span_iv.add(spans[-1].start, spans[-1].end)
 
         # Resolve overlapping spans: keep longer span, earlier start
         spans.sort(key=lambda s: (s.start, -(s.end - s.start)))

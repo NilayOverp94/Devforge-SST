@@ -632,6 +632,28 @@ def _extract_from_json_obj(
     _walk(obj, [])
 
 
+def split_text_chunks(text: str, target_bytes: int = 65536) -> list[str]:
+    """Split large plain-text documents along paragraph/line boundaries without breaking lines."""
+    n = len(text)
+    if n <= target_bytes:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < n:
+        end = min(n, start + target_bytes)
+        if end < n:
+            split_at = text.rfind("\n\n", start, end)
+            if split_at > start:
+                end = split_at + 2
+            else:
+                split_at = text.rfind("\n", start, end)
+                if split_at > start:
+                    end = split_at + 1
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
 def _extract_from_text(
     text: str,
     rc: RecordClues,
@@ -639,32 +661,38 @@ def _extract_from_text(
     date_hint: str,
     modal_year: int,
 ) -> None:
-    spans = detector.detect_text(text, allow_pin_scan=True)
-    for sp in spans:
-        if sp.pii_type == "MRN" and sp.normalized:
-            rc.mrns.add(norm_mrn_key(sp.normalized))
-        elif sp.pii_type == "PHONE" and sp.normalized:
-            rc.phones.add(sp.normalized)
-        elif sp.pii_type == "ABHA_NUMBER" and sp.normalized:
-            rc.abhas.add(sp.normalized)
-        elif sp.pii_type == "AADHAAR" and sp.normalized:
-            rc.aadhaars.add(sp.normalized)
-        elif sp.pii_type == "EMAIL" and sp.normalized:
-            rc.emails.add(sp.normalized)
-        elif sp.pii_type == "PAN" and sp.normalized:
-            rc.pans.add(sp.normalized)
-        elif sp.pii_type == "PATIENT_NAME":
-            rc.patient_names.append(sp.surface)
-        elif sp.pii_type == "RELATIVE_NAME":
-            rel_clean = re.sub(r"(?i)^\s*(?:[sdwfmc]/o|c/o)\s+", "", sp.surface).strip()
-            rc.relative_names.append(rel_clean or sp.surface)
-        elif sp.pii_type == "PIN" and sp.normalized:
-            rc.pin = sp.normalized
-        elif sp.pii_type == "VILLAGE":
-            # Strip prefix label
-            v = re.sub(r"(?i)^(?:vill\.?|village|gram|gaon|ग्राम|गाँव|गांव)\s*[:\-]?\s*", "", sp.surface).strip()
-            if v:
-                rc.village = v
+    for chunk in split_text_chunks(text):
+        spans = detector.detect_text(chunk, allow_pin_scan=True)
+        for sp in spans:
+            if sp.pii_type == "MRN" and sp.normalized:
+                rc.mrns.add(norm_mrn_key(sp.normalized))
+            elif sp.pii_type == "PHONE" and sp.normalized:
+                rc.phones.add(sp.normalized)
+            elif sp.pii_type == "ABHA_NUMBER" and sp.normalized:
+                rc.abhas.add(sp.normalized)
+            elif sp.pii_type == "AADHAAR" and sp.normalized:
+                rc.aadhaars.add(sp.normalized)
+            elif sp.pii_type == "EMAIL" and sp.normalized:
+                rc.emails.add(sp.normalized)
+            elif sp.pii_type == "PAN" and sp.normalized:
+                rc.pans.add(sp.normalized)
+            elif sp.pii_type == "PATIENT_NAME":
+                rc.patient_names.append(sp.surface)
+            elif sp.pii_type == "RELATIVE_NAME":
+                rel_clean = re.sub(r"(?i)^\s*(?:[sdwfmc]/o|c/o)\s+", "", sp.surface).strip()
+                rc.relative_names.append(rel_clean or sp.surface)
+            elif sp.pii_type == "PIN" and sp.normalized:
+                rc.pin = sp.normalized
+            elif sp.pii_type == "VILLAGE":
+                # Strip prefix label
+                v = re.sub(r"(?i)^(?:vill\.?|village|gram|gaon|ग्राम|गाँव|गांव)\s*[:\-]?\s*", "", sp.surface).strip()
+                if v:
+                    rc.village = v
+
+    if rc.patient_names:
+        rc.patient_names = list(dict.fromkeys(rc.patient_names))
+    if rc.relative_names:
+        rc.relative_names = list(dict.fromkeys(rc.relative_names))
 
     # Extract Age, Gender, DOB, District, Diagnoses, Dates from text lines
     norm = to_ascii_digits(text)
@@ -977,75 +1005,76 @@ def link_all_records(
     for _pass in range(3):
         cids_sorted = sorted(clusters.keys())
         dob_index: dict[str, list[str]] = defaultdict(list)
-        name_rel_index: dict[tuple[str, str], list[str]] = defaultdict(list)
-        name_rel_no_aadhaar: dict[tuple[str, str], list[str]] = defaultdict(list)
-        name_vil_index: dict[tuple[str, str], list[str]] = defaultdict(list)
-        name_vil_no_aadhaar: dict[tuple[str, str], list[str]] = defaultdict(list)
-        cluster_keys: dict[str, tuple[set[str], set[str], set[str]]] = {}
-        has_aadhaar_cids: set[str] = set()
-        has_abha_cids: set[str] = set()
-        has_pan_cids: set[str] = set()
-        gender_cids: dict[str, set[str]] = defaultdict(set)
+        # Bucket by (n_skel, r_or_v_skel, gender_tag, age_bin) so homonym/no-Aadhaar lookups stay O(1)
+        name_rel_idx: dict[tuple[str, str, str, int], list[str]] = defaultdict(list)
+        name_rel_no_aad: dict[tuple[str, str, str, int], list[str]] = defaultdict(list)
+        name_vil_idx: dict[tuple[str, str, str, int], list[str]] = defaultdict(list)
+        name_vil_no_aad: dict[tuple[str, str, str, int], list[str]] = defaultdict(list)
+        cluster_meta: dict[str, tuple[set[str], set[str], set[str], str, set[int]]] = {}
 
         for cid in cids_sorted:
             cl = clusters[cid]
             has_aad = bool(cl.aadhaars)
-            if has_aad:
-                has_aadhaar_cids.add(cid)
-            if cl.abhas:
-                has_abha_cids.add(cid)
-            if cl.pans:
-                has_pan_cids.add(cid)
-            for g in cl.genders:
-                gender_cids[g].add(cid)
+            g_tag = next(iter(cl.genders)) if len(cl.genders) == 1 else "U"
+            a_bins = {a // 5 for a in cl.ages} if cl.ages else {-1}
             for d in cl.dobs:
                 dob_index[d].append(cid)
             nk, rk, vk = _cluster_block_keys(cl)
-            cluster_keys[cid] = (nk, rk, vk)
+            cluster_meta[cid] = (nk, rk, vk, g_tag, a_bins)
             for n1 in nk:
                 for r1 in rk:
-                    name_rel_index[(n1, r1)].append(cid)
-                    if not has_aad:
-                        name_rel_no_aadhaar[(n1, r1)].append(cid)
+                    for ab in a_bins:
+                        key = (n1, r1, g_tag, ab)
+                        name_rel_idx[key].append(cid)
+                        if not has_aad:
+                            name_rel_no_aad[key].append(cid)
                 for v1 in vk:
-                    name_vil_index[(n1, v1)].append(cid)
-                    if not has_aad:
-                        name_vil_no_aadhaar[(n1, v1)].append(cid)
+                    for ab in a_bins:
+                        key = (n1, v1, g_tag, ab)
+                        name_vil_idx[key].append(cid)
+                        if not has_aad:
+                            name_vil_no_aad[key].append(cid)
 
         merged_this_pass = False
         for cid_a in cids_sorted:
             if cid_a not in clusters:
                 continue
             ca = clusters[cid_a]
-            nk, rk, vk = cluster_keys[cid_a]
+            nk, rk, vk, g_tag, a_bins = cluster_meta[cid_a]
+            g_targets = (g_tag, "U") if g_tag != "U" else ("M", "F", "U")
+            if -1 in a_bins:
+                ab_targets: tuple[int, ...] = tuple(range(-1, 25))
+            else:
+                ab_set: set[int] = {-1}
+                for a in ca.ages:
+                    ab_set.add((a - max_age_diff) // 5)
+                    ab_set.add((a + max_age_diff) // 5)
+                ab_targets = tuple(ab_set)
+
             cand_cids: set[str] = set()
             for d in ca.dobs:
-                cand_cids.update(dob_index[d])
-            nr_src = name_rel_no_aadhaar if ca.aadhaars else name_rel_index
-            nv_src = name_vil_no_aadhaar if ca.aadhaars else name_vil_index
+                b = dob_index.get(d)
+                if b and len(b) <= 256:
+                    cand_cids.update(b)
+            nr_src = name_rel_no_aad if ca.aadhaars else name_rel_idx
+            nv_src = name_vil_no_aad if ca.aadhaars else name_vil_idx
             for n1 in nk:
                 for r1 in rk:
-                    if (n1, r1) in nr_src:
-                        cand_cids.update(nr_src[(n1, r1)])
+                    for gt in g_targets:
+                        for ab in ab_targets:
+                            b = nr_src.get((n1, r1, gt, ab))
+                            if b and len(b) <= 128:
+                                cand_cids.update(b)
                 for v1 in vk:
-                    if (n1, v1) in nv_src:
-                        cand_cids.update(nv_src[(n1, v1)])
+                    for gt in g_targets:
+                        for ab in ab_targets:
+                            b = nv_src.get((n1, v1, gt, ab))
+                            # A (name, village, gender, 5-yr age_bin) bucket with > 32 clusters is a non-unique homonym crowd
+                            if b and len(b) <= 32:
+                                cand_cids.update(b)
             cand_cids.discard(cid_a)
             if not cand_cids:
                 continue
-            # Fast conflict pruning: Stage 1 already merged identical aadhaar/abha/pan,
-            # so two clusters that both have aadhaar (or abha, or pan) cannot merge in Stage 2.
-            if ca.aadhaars:
-                cand_cids.difference_update(has_aadhaar_cids)
-            if ca.abhas:
-                cand_cids.difference_update(has_abha_cids)
-            if ca.pans:
-                cand_cids.difference_update(has_pan_cids)
-            if len(ca.genders) == 1:
-                g_a = next(iter(ca.genders))
-                for g_other, g_set in gender_cids.items():
-                    if g_other != g_a:
-                        cand_cids.difference_update(g_set)
 
             candidates: list[tuple[float, str]] = []
             tie_20 = 0

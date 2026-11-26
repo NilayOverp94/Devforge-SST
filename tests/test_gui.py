@@ -290,6 +290,48 @@ class TestRakshaGUI(unittest.TestCase):
                 self.assertTrue(any(n.startswith("sanitized/") and n.endswith(".csv") for n in names))
                 self.assertFalse(any("bad.json" in n for n in names))
 
+    def test_staged_streaming_upload_and_summary(self) -> None:
+        csv_bytes = (
+            "patient_name,age,mobile,diagnosis\n"
+            "Reena Nishad,65,7560010034,Urinary tract infection\n"
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory(prefix="raksha-gui-staged-test-") as tmp:
+            out_dir = Path(tmp) / "staged_out"
+            st_s, start_res = self._post_json("/api/stage-start", {})
+            self.assertEqual(st_s, 200)
+            stage_id = start_res["stage_id"]
+
+            # Reject path traversal on /api/stage-file
+            req_bad = urllib.request.Request(
+                f"{self.base_url}/api/stage-file?stage_id={urllib.parse.quote(stage_id)}&rel_path={urllib.parse.quote('../../evil.csv')}",
+                data=b"x",
+                headers={"Content-Type": "application/octet-stream", "Content-Length": "1"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_bad, timeout=30)
+            self.assertEqual(ctx.exception.code, 400)
+
+            # Upload valid file as raw binary stream
+            req_ok = urllib.request.Request(
+                f"{self.base_url}/api/stage-file?stage_id={urllib.parse.quote(stage_id)}&rel_path={urllib.parse.quote('opd/visits.csv')}",
+                data=csv_bytes,
+                headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(csv_bytes))},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_ok, timeout=30) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertTrue(json.loads(resp.read().decode("utf-8"))["ok"])
+
+            st_run, run_res = self._post_json(
+                "/api/run-staged",
+                {"stage_id": stage_id, "output_dir": str(out_dir), "secret": "STAGED_TEST_SECRET"},
+            )
+            self.assertEqual(st_run, 200)
+            self.assertTrue(run_res["ok"])
+            self.assertEqual(run_res["report"]["counts"]["files_sanitized"], 1)
+            self.assertNotIn("STAGED_TEST_SECRET", json.dumps(run_res))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
