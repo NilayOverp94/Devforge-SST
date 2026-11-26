@@ -153,6 +153,8 @@ function renderDashboard(data) {
   const zipBtn = document.getElementById("btn-download-zip");
   if (zipBtn) zipBtn.disabled = !(data && data.exists);
   if (!data || !data.exists) return;
+  const resultsEl = document.getElementById("overview-results");
+  if (resultsEl) resultsEl.classList.remove("hidden");
 
   const rep = data.report || {};
   const counts = rep.counts || {};
@@ -792,14 +794,6 @@ async function bootstrap() {
     document.getElementById("btn-use-dev").classList.remove("hidden");
   }
   renderPolicyForm(defs.policy || {});
-
-  // Preload Hindi sandbox preset
-  document.getElementById("sbx-input").value = PRESETS.hindi.text;
-
-  if (defs.has_existing_output) {
-    const existing = await apiGet(`/api/results?output_dir=${encodeURIComponent(defs.output_dir)}`);
-    if (existing.exists) renderDashboard(existing);
-  }
 }
 
 document.addEventListener("DOMContentLoaded", bootstrap);
