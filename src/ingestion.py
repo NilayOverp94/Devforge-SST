@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,9 @@ from typing import Any
 from .security import sha256_bytes
 
 SUPPORTED_EXTS = {".csv", ".tsv", ".json", ".txt"}
+_CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_BAD_CP1252_RE = re.compile(rb"[\x00\x81\x8d\x8f\x90\x9d\xfe\xff]")
+_JSON_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|([{}\[\]])')
 
 
 class QuarantineError(ValueError):
@@ -26,6 +31,7 @@ class IngestedFile:
     delimiter: str | None = None
     raw_size: int = 0
     text: str | None = None
+    sample_text: str | None = None
     data: Any = None
     quarantine_reason: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
@@ -60,15 +66,14 @@ def decode_text_strict(raw: bytes) -> str:
     try:
         text = raw.decode("utf-8", errors="strict")
         # Reject suspicious C0 controls other than \t, \n, \r
-        if any(ord(ch) < 32 and ch not in ("\t", "\n", "\r") for ch in text):
+        if _CTRL_CHAR_RE.search(text):
             raise QuarantineError("control_bytes")
         return text
     except UnicodeDecodeError:
         pass
 
     # Fallback cp1252 ONLY for clean legacy text exports (reject corrupt UTF-8 fragments like \xff\xfe\xc3)
-    bad_cp1252_bytes = {0x00, 0x81, 0x8D, 0x8F, 0x90, 0x9D, 0xFE, 0xFF}
-    if any(b in bad_cp1252_bytes for b in raw):
+    if _BAD_CP1252_RE.search(raw):
         raise QuarantineError("corrupt_encoding")
     if b"\xc3(" in raw or b"\xc2(" in raw:
         raise QuarantineError("corrupt_encoding")
@@ -78,7 +83,7 @@ def decode_text_strict(raw: bytes) -> str:
     except UnicodeDecodeError as exc:
         raise QuarantineError("undecodable_text") from exc
 
-    if any(ord(ch) < 32 and ch not in ("\t", "\n", "\r") for ch in text):
+    if _CTRL_CHAR_RE.search(text):
         raise QuarantineError("control_bytes")
     return text
 
@@ -86,24 +91,14 @@ def decode_text_strict(raw: bytes) -> str:
 def check_json_depth(text: str, max_depth: int) -> None:
     """Iterative JSON bracket-depth check without Python stack overflow."""
     depth = 0
-    in_str = False
-    escaped = False
-    for ch in text:
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\" and in_str:
-            escaped = True
-            continue
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if not in_str:
+    for m in _JSON_TOKEN_RE.finditer(text):
+        ch = m.group(1)
+        if ch is not None:
             if ch in ("{", "["):
                 depth += 1
                 if depth > max_depth:
                     raise QuarantineError("excessive_nesting")
-            elif ch in ("}", "]"):
+            else:
                 depth -= 1
 
 
@@ -150,25 +145,53 @@ def validate_fhir_bundle(bundle: dict[str, Any]) -> bool:
     return _check_refs(bundle["entry"])
 
 
+def _sha256_file_stream(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(4194304)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def parse_file(
     path: Path,
     input_root: Path,
     max_json_depth: int = 200,
-    max_file_bytes: int = 104857600,
+    max_file_bytes: int = 4294967296,
 ) -> IngestedFile:
     """Read, validate, and parse a single input file, or mark quarantined on any anomaly."""
     rel = path.relative_to(input_root).as_posix()
+    ext = path.suffix.lower()
+    raw_size = path.stat().st_size
+
+    if raw_size > max_file_bytes:
+        return IngestedFile(
+            rel_path=rel,
+            sha256=_sha256_file_stream(path),
+            ext=ext,
+            fmt="quarantined",
+            raw_size=raw_size,
+            quarantine_reason="file_too_large",
+        )
+    if ext not in SUPPORTED_EXTS:
+        return IngestedFile(
+            rel_path=rel,
+            sha256=_sha256_file_stream(path),
+            ext=ext,
+            fmt="quarantined",
+            raw_size=raw_size,
+            quarantine_reason="unsupported_format",
+        )
+
     raw = path.read_bytes()
     digest = sha256_bytes(raw)
-    ext = path.suffix.lower()
 
     try:
-        if len(raw) > max_file_bytes:
-            raise QuarantineError("file_too_large")
-        if ext not in SUPPORTED_EXTS:
-            raise QuarantineError("unsupported_format")
-
         text = decode_text_strict(raw)
+        del raw
 
         if ext in (".csv", ".tsv"):
             delim = "\t" if ext == ".tsv" else ","
@@ -185,8 +208,9 @@ def parse_file(
                 ext=ext,
                 fmt="tsv" if ext == ".tsv" else "csv",
                 delimiter=delim,
-                raw_size=len(raw),
-                text=text,
+                raw_size=raw_size,
+                text=None,
+                sample_text=text[:65536],
                 data=rows,
             )
 
@@ -204,8 +228,9 @@ def parse_file(
                 sha256=digest,
                 ext=ext,
                 fmt="fhir" if is_fhir else "json",
-                raw_size=len(raw),
-                text=text,
+                raw_size=raw_size,
+                text=None,
+                sample_text=text[:65536],
                 data=data,
             )
 
@@ -215,9 +240,10 @@ def parse_file(
             sha256=digest,
             ext=ext,
             fmt="text",
-            raw_size=len(raw),
+            raw_size=raw_size,
             text=text,
-            data=text,
+            sample_text=text[:65536],
+            data=None,
         )
 
     except QuarantineError as exc:
@@ -226,7 +252,7 @@ def parse_file(
             sha256=digest,
             ext=ext,
             fmt="quarantined",
-            raw_size=len(raw),
+            raw_size=raw_size,
             quarantine_reason=str(exc),
         )
     except (csv.Error, UnicodeError, RecursionError, ValueError) as exc:
@@ -235,7 +261,7 @@ def parse_file(
             sha256=digest,
             ext=ext,
             fmt="quarantined",
-            raw_size=len(raw),
+            raw_size=raw_size,
             quarantine_reason=type(exc).__name__,
         )
 
@@ -243,7 +269,7 @@ def parse_file(
 def ingest_directory(
     input_dir: Path,
     max_json_depth: int = 200,
-    max_file_bytes: int = 104857600,
+    max_file_bytes: int = 4294967296,
 ) -> list[IngestedFile]:
     """Deterministically walk and parse every file under input_dir."""
     paths = sorted((p for p in input_dir.rglob("*") if p.is_file()), key=lambda p: p.relative_to(input_dir).as_posix())

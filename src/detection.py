@@ -7,6 +7,7 @@ import json
 import re as std_re
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -37,13 +38,18 @@ _ITRANS_NUKTA_RE = std_re.compile(r"([a-zA-Z])\.([a-zA-Z])")
 
 def shadow_normalize(text: str) -> str:
     """Length-preserving normalization (Indic digits -> ASCII, homoglyphs -> Latin) for exact-span regex."""
+    if text.isascii():
+        return text
     return text.translate(_DEVA_DIGITS).translate(_HOMOGLYPHS)
 
 
 def to_ascii_digits(text: str) -> str:
+    if text.isascii():
+        return text
     return text.translate(_DEVA_DIGITS)
 
 
+@lru_cache(maxsize=65536)
 def transliterate_deva_to_latin(text: str) -> str:
     """Transliterate Devanagari text to readable Latin using indic-transliteration + nukta handling."""
     if not text or not any("\u0900" <= ch <= "\u097f" for ch in text):
@@ -107,13 +113,33 @@ _HINDI_VARIANT_SUBS = [
 ]
 
 
-def canonicalize_person_name(name: str, strip_honorifics: bool = True) -> list[str]:
+_RX_NON_WORD_SPACE = std_re.compile(r"[^\w\s]")
+_RX_NON_WORD = std_re.compile(r"[^\w]")
+_RX_DIGITS_ONLY = std_re.compile(r"\D")
+_RX_HAS_10_DIGITS = std_re.compile(r"(?:\D*\d){10}")
+_RX_ADDR_FOLLOW = std_re.compile(r"^\s*,\s*(?:h\.?no|house|makan|ward|mohalla|vill|gram|tehsil|distt)")
+_RX_MRN_EXCLUDE = std_re.compile(r"(?i)(?:ICD|LOINC|MG|SG|SE|OPD|BL)[-/0-9A-Z]*")
+_CAND_RX_LIST = (
+    regex.compile(r"\b[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){1,2}\b"),
+    regex.compile(r"\b[A-Z]{2,20}\s+[A-Z]{2,20}\b"),
+    regex.compile(r"[\p{Devanagari}]{2,20}\s+[\p{Devanagari}]{2,20}"),
+)
+_RX_CAP_WORD_4 = regex.compile(r"\b[A-Z][a-z]{3,20}\b")
+
+
+@lru_cache(maxsize=4096)
+def _compile_token_rx(tok: str) -> regex.Pattern[str]:
+    return regex.compile(r"(?i)(?<!\p{L})" + regex.escape(tok) + r"(?!\p{L})")
+
+
+@lru_cache(maxsize=65536)
+def _canonicalize_person_name_cached(name: str, strip_honorifics: bool = True) -> tuple[str, ...]:
     """Transliterate and canonically normalize a person name into phonetic tokens."""
     if not name:
-        return []
+        return ()
     cleaned = _REL_PREFIX_RE.sub("", name.strip())
     lat = transliterate_deva_to_latin(unicodedata.normalize("NFKC", cleaned))
-    lat = std_re.sub(r"[^\w\s]", " ", lat.lower())
+    lat = _RX_NON_WORD_SPACE.sub(" ", lat.lower())
     tokens = []
     for raw_t in lat.split():
         t = raw_t.strip("_")
@@ -130,14 +156,20 @@ def canonicalize_person_name(name: str, strip_honorifics: bool = True) -> list[s
             t = t[:-1]
         if t:
             tokens.append(t)
-    return tokens
+    return tuple(tokens)
 
 
+def canonicalize_person_name(name: str, strip_honorifics: bool = True) -> list[str]:
+    """Transliterate and canonically normalize a person name into phonetic tokens."""
+    return list(_canonicalize_person_name_cached(name, strip_honorifics))
+
+
+@lru_cache(maxsize=65536)
 def canonicalize_place(name: str) -> str:
     if not name:
         return ""
     lat = transliterate_deva_to_latin(unicodedata.normalize("NFKC", name))
-    lat = std_re.sub(r"[^\w\s]", " ", lat.lower())
+    lat = _RX_NON_WORD_SPACE.sub(" ", lat.lower())
     toks = []
     for t in lat.split():
         for rx, repl in _HINDI_VARIANT_SUBS:
@@ -149,17 +181,22 @@ def canonicalize_place(name: str) -> str:
     return " ".join(toks)
 
 
+_RX_VOWELS = std_re.compile(r"[aeiou]")
+
+
+@lru_cache(maxsize=65536)
 def _consonant_skeleton(tok: str) -> str:
     """Indic consonant skeleton keeping initial vowel (handles Devanagari schwa-deletion variants)."""
     if not tok:
         return ""
-    return tok[0] + std_re.sub(r"[aeiou]", "", tok[1:])
+    return tok[0] + _RX_VOWELS.sub("", tok[1:])
 
 
+@lru_cache(maxsize=65536)
 def names_similarity(name_a: str, name_b: str) -> float:
     """Cross-script phonetic + Indic consonant-skeleton similarity in [0, 1]."""
-    ta = canonicalize_person_name(name_a)
-    tb = canonicalize_person_name(name_b)
+    ta = _canonicalize_person_name_cached(name_a)
+    tb = _canonicalize_person_name_cached(name_b)
     if not ta or not tb:
         return 0.0
     sa = " ".join(ta)
@@ -193,6 +230,7 @@ def names_similarity(name_a: str, name_b: str) -> float:
     return max(s1, s2, sk_sim)
 
 
+@lru_cache(maxsize=65536)
 def places_similarity(place_a: str, place_b: str) -> float:
     """Cross-script place/district/village similarity handling Devanagari schwa deletion."""
     pa = canonicalize_place(place_a)
@@ -600,6 +638,7 @@ class PIIDetector:
 
     def __init__(self, model_path: Path | None = None) -> None:
         self.ml = NameSpanClassifier(model_path=model_path)
+        self._id_pii_cache: dict[str, bool] = {}
 
     def protected_spans(self, text: str) -> list[tuple[int, int]]:
         """Find clinical spans (doctors, eponyms, K/C/O, C/O complaints, wards, doses, labs, ASHA) to preserve."""
@@ -609,7 +648,7 @@ class PIIDetector:
                 spans.append((m.start(), m.end()))
         for m in _RX_LAB_RANGE.finditer(text):
             # Only protect numeric range if it's NOT a 10-digit Indian mobile (5-5 split)
-            digits = std_re.sub(r"\D", "", m.group(0))
+            digits = _RX_DIGITS_ONLY.sub("", m.group(0))
             if not (len(digits) == 10 and digits[0] in "6789"):
                 spans.append((m.start(), m.end()))
 
@@ -620,7 +659,7 @@ class PIIDetector:
             line_prefix = text[line_start:m.start()].lower()
             is_addr_ctx = any(k in line_prefix for k in ("address", "pata", "attendant", "guardian", "पता"))
             after_comma = text[m.end():m.end() + 30].lower()
-            has_addr_follow = bool(std_re.search(r"^\s*,\s*(?:h\.?no|house|makan|ward|mohalla|vill|gram|tehsil|distt)", after_comma))
+            has_addr_follow = bool(_RX_ADDR_FOLLOW.search(after_comma))
             if not is_addr_ctx and not has_addr_follow and _SYMPTOM_WORDS_RE.match(after):
                 # Protect the whole C/O complaint phrase up to newline/semicolon
                 end_line = text.find("\n", m.start())
@@ -638,7 +677,7 @@ class PIIDetector:
         toks = s.split()
         if len(toks) > 4:
             return False
-        lower_toks = [std_re.sub(r"[^\w]", "", t.lower()) for t in toks]
+        lower_toks = [_RX_NON_WORD.sub("", t.lower()) for t in toks]
         # Gazetteer hit (Latin or Devanagari)
         if any(t in _LATIN_NAME_GAZETTEER for t in lower_toks if len(t) >= 3):
             return True
@@ -672,7 +711,7 @@ class PIIDetector:
 
         # 1. Structured numeric & alphanumeric direct identifiers (highest priority - never blocked by lab range guards)
         for m in _RX_ABHA_NUM.finditer(shadow):
-            _add_span(spans, m.start(), m.end(), "ABHA_NUMBER", text, std_re.sub(r"\D", "", m.group(0)))
+            _add_span(spans, m.start(), m.end(), "ABHA_NUMBER", text, _RX_DIGITS_ONLY.sub("", m.group(0)))
 
         for m in _RX_ABHA_ADDR.finditer(shadow):
             _add_span(spans, m.start(), m.end(), "ABHA_ADDRESS", text, m.group(0).lower())
@@ -680,9 +719,13 @@ class PIIDetector:
         for m in _RX_AADHAAR_MASKED.finditer(shadow):
             _add_span(spans, m.start(), m.end(), "AADHAAR_MASKED", text, m.group(0).lower())
 
+        span_ranges = [(s.start, s.end) for s in spans]
         for m in _RX_AADHAAR.finditer(shadow):
-            if not _overlaps_any(m.start(), m.end(), [(s.start, s.end) for s in spans]):
-                _add_span(spans, m.start(), m.end(), "AADHAAR", text, std_re.sub(r"\D", "", m.group(0)))
+            if not _overlaps_any(m.start(), m.end(), span_ranges):
+                prev_len = len(spans)
+                _add_span(spans, m.start(), m.end(), "AADHAAR", text, _RX_DIGITS_ONLY.sub("", m.group(0)))
+                if len(spans) > prev_len:
+                    span_ranges.append((spans[-1].start, spans[-1].end))
 
         for m in _RX_EMAIL.finditer(shadow):
             _add_span(spans, m.start(), m.end(), "EMAIL", text, m.group(0).lower())
@@ -695,23 +738,35 @@ class PIIDetector:
 
         for rx in (_RX_PHONE_0, _RX_PHONE_1, _RX_PHONE_2):
             for m in rx.finditer(shadow):
-                digits = std_re.sub(r"\D", "", m.group(0))
+                digits = _RX_DIGITS_ONLY.sub("", m.group(0))
                 if len(digits) >= 10:
                     _add_span(spans, m.start(), m.end(), "PHONE", text, digits[-10:])
 
-        # Fallback offline libphonenumber matcher for unusual formats
-        try:
-            for match in phonenumbers.PhoneNumberMatcher(shadow, "IN"):
-                digits = std_re.sub(r"\D", "", match.raw_string)
-                if len(digits) >= 10 and not _overlaps_any(match.start, match.end, [(s.start, s.end) for s in spans]):
-                    _add_span(spans, match.start, match.end, "PHONE", text, digits[-10:])
-        except Exception:
-            pass
+        # Fallback offline libphonenumber matcher for unusual formats (only if >=10 digits exist outside already-matched spans)
+        if _RX_HAS_10_DIGITS.search(shadow):
+            # Quick check: count digits not already covered by PHONE/AADHAAR/ABHA spans
+            covered = set()
+            for sp in spans:
+                if sp.pii_type in ("PHONE", "AADHAAR", "AADHAAR_MASKED", "ABHA_NUMBER"):
+                    covered.update(range(sp.start, sp.end))
+            uncovered_digits = sum(1 for idx, ch in enumerate(shadow) if ch.isdigit() and idx not in covered)
+            if uncovered_digits >= 10:
+                try:
+                    span_ranges = [(s.start, s.end) for s in spans]
+                    for match in phonenumbers.PhoneNumberMatcher(shadow, "IN"):
+                        digits = _RX_DIGITS_ONLY.sub("", match.raw_string)
+                        if len(digits) >= 10 and not _overlaps_any(match.start, match.end, span_ranges):
+                            prev_len = len(spans)
+                            _add_span(spans, match.start, match.end, "PHONE", text, digits[-10:])
+                            if len(spans) > prev_len:
+                                span_ranges.append((spans[-1].start, spans[-1].end))
+                except Exception:
+                    pass
 
         for rx in (_RX_MRN_KNOWN, _RX_MRN_GENERIC, _RX_MRN_LABELED):
             for m in rx.finditer(shadow):
                 tok = m.group(0).strip()
-                if not std_re.fullmatch(r"(?i)(?:ICD|LOINC|MG|SG|SE|OPD|BL)[-/0-9A-Z]*", tok):
+                if not _RX_MRN_EXCLUDE.fullmatch(tok):
                     _add_span(spans, m.start(), m.end(), "MRN", text, tok.upper())
 
         # 2. Address components (House, Locality, Landmark, Village, Tehsil, PIN)
@@ -812,11 +867,7 @@ class PIIDetector:
 
         # 4. General Classical ML + Gazetteer sweep for un-anchored 2-3 word names & canaries
         occupied = prot + [(s.start, s.end) for s in spans]
-        for cand_rx in (
-            regex.compile(r"\b[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){1,2}\b"),
-            regex.compile(r"\b[A-Z]{2,20}\s+[A-Z]{2,20}\b"),
-            regex.compile(r"[\p{Devanagari}]{2,20}\s+[\p{Devanagari}]{2,20}"),
-        ):
+        for cand_rx in _CAND_RX_LIST:
             for m in cand_rx.finditer(text):
                 if _overlaps_any(m.start(), m.end(), occupied):
                     continue
@@ -828,30 +879,44 @@ class PIIDetector:
                     occupied.append((m.start(), m.end()))
 
         # 5. Propagate known patient/relative name variants (including phonetic equivalents like Hareesh/Harish)
-        for name_list, ptype, role in (
-            (extra_patient_names or [], "PATIENT_NAME", "patient"),
-            (extra_relative_names or [], "RELATIVE_NAME", "relative"),
-        ):
-            extra_firsts = []
-            for nm in name_list:
-                for tok in self._expand_name_variants(nm):
-                    if len(tok) < 3 or tok.lower() in _NON_PII_WORDS or tok.lower() in _GENERIC_NAME_PARTS:
-                        continue
-                    extra_firsts.append(tok)
-                    pat = regex.compile(r"(?i)(?<!\p{L})" + regex.escape(tok) + r"(?!\p{L})")
-                    for m in pat.finditer(text):
-                        if not _overlaps_any(m.start(), m.end(), prot) and not _overlaps_any(m.start(), m.end(), [(s.start, s.end) for s in spans]):
+        if extra_patient_names or extra_relative_names:
+            text_lower = text.lower()
+            span_ranges = [(s.start, s.end) for s in spans]
+            for name_list, ptype, role in (
+                (extra_patient_names or (), "PATIENT_NAME", "patient"),
+                (extra_relative_names or (), "RELATIVE_NAME", "relative"),
+            ):
+                if not name_list:
+                    continue
+                extra_firsts = []
+                for nm in name_list:
+                    for tok in self._expand_name_variants(nm):
+                        tl = tok.lower()
+                        if len(tok) < 3 or tl in _NON_PII_WORDS or tl in _GENERIC_NAME_PARTS:
+                            continue
+                        extra_firsts.append(tok)
+                        if tl not in text_lower:
+                            continue
+                        pat = _compile_token_rx(tok)
+                        for m in pat.finditer(text):
+                            if not _overlaps_any(m.start(), m.end(), prot) and not _overlaps_any(m.start(), m.end(), span_ranges):
+                                prev_len = len(spans)
+                                _add_span(spans, m.start(), m.end(), ptype, text, role=role)
+                                if len(spans) > prev_len:
+                                    span_ranges.append((spans[-1].start, spans[-1].end))
+                # Phonetic match on capitalized single prose tokens >= 4 chars (catches Harish vs Hareesh, Aneeta vs Anita)
+                if extra_firsts:
+                    for m in _RX_CAP_WORD_4.finditer(text):
+                        if _overlaps_any(m.start(), m.end(), prot) or _overlaps_any(m.start(), m.end(), span_ranges):
+                            continue
+                        cand = m.group(0)
+                        if cand.lower() in _NON_PII_WORDS:
+                            continue
+                        if any(names_similarity(cand, ref) >= 0.88 for ref in extra_firsts):
+                            prev_len = len(spans)
                             _add_span(spans, m.start(), m.end(), ptype, text, role=role)
-            # Phonetic match on capitalized single prose tokens >= 4 chars (catches Harish vs Hareesh, Aneeta vs Anita)
-            if extra_firsts:
-                for m in regex.finditer(r"\b[A-Z][a-z]{3,20}\b", text):
-                    if _overlaps_any(m.start(), m.end(), prot) or _overlaps_any(m.start(), m.end(), [(s.start, s.end) for s in spans]):
-                        continue
-                    cand = m.group(0)
-                    if cand.lower() in _NON_PII_WORDS:
-                        continue
-                    if any(names_similarity(cand, ref) >= 0.88 for ref in extra_firsts):
-                        _add_span(spans, m.start(), m.end(), ptype, text, role=role)
+                            if len(spans) > prev_len:
+                                span_ranges.append((spans[-1].start, spans[-1].end))
 
         # Resolve overlapping spans: keep longer span, earlier start
         spans.sort(key=lambda s: (s.start, -(s.end - s.start)))
@@ -865,9 +930,9 @@ class PIIDetector:
 
     @staticmethod
     def _expand_name_variants(name: str) -> list[str]:
-        parts = [p.strip(".,") for p in name.split() if len(p.strip(".,")) >= 3]
+        parts = [p.strip(".,") for p in name.split() if len(p.strip(".,")) >= 3 and not p.strip(".,").isdigit()]
         variants = []
-        if name.strip():
+        if name.strip() and not name.strip().isdigit():
             variants.append(name.strip())
         for p in parts:
             if p.lower() not in _HONORIFIC_TOKENS and p.lower() not in _GENERIC_NAME_PARTS:
@@ -914,6 +979,15 @@ class PIIDetector:
         """Check whether a filename, header, or JSON key contains PII."""
         if not text:
             return False
+        cached = self._id_pii_cache.get(text)
+        if cached is not None:
+            return cached
+        res = self._has_pii_in_identifier_uncached(text)
+        if len(self._id_pii_cache) < 65536:
+            self._id_pii_cache[text] = res
+        return res
+
+    def _has_pii_in_identifier_uncached(self, text: str) -> bool:
         # Technical snake_case / lowercase keys or filenames without digits/gazetteer names are schema/file labels
         is_all_lower_ascii = bool(std_re.fullmatch(r"[a-z0-9_\-./\s]+", text))
         if self.classify_column_header(text) != "OTHER" and not std_re.search(r"\d{4,}", text):

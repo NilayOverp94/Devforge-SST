@@ -10,6 +10,7 @@ from typing import Any
 
 from .detection import (
     PIIDetector,
+    _consonant_skeleton,
     canonicalize_person_name,
     canonicalize_place,
     names_similarity,
@@ -91,9 +92,10 @@ def infer_file_date_hints(files: list[IngestedFile]) -> tuple[dict[str, str], in
     year_counts: dict[int, int] = defaultdict(int)
 
     for inf in files:
-        if inf.quarantine_reason or not inf.text:
+        raw_sample = inf.text or inf.sample_text
+        if inf.quarantine_reason or not raw_sample:
             continue
-        txt = to_ascii_digits(inf.text)
+        txt = to_ascii_digits(raw_sample)
         hosp = detect_hospital_name(txt) or detect_hospital_name(inf.rel_path)
         file_hosp[inf.rel_path] = hosp
 
@@ -944,22 +946,112 @@ def link_all_records(
                     changed = True
 
     # Stage 2: Cross-hospital / Cross-script / Bio+Relative+Village merges
-    # Run multiple conservative passes, only merging when candidate match is unambiguous (unique or zero conflict)
+    # Use inverted blocking indexes (DOB, (name_skel, rel_skel), (name_skel, vil_skel)) for O(N) scaling
+    _generic_skels = {_consonant_skeleton(g) for g in ("devi", "kumari", "kumar", "lal", "singh", "bano", "begum", "khatun", "kaur")}
+
+    def _cluster_block_keys(cl: PatientCluster) -> tuple[set[str], set[str], set[str]]:
+        n_keys: set[str] = set()
+        for nm in cl.patient_names:
+            toks = canonicalize_person_name(nm)
+            sks = [_consonant_skeleton(tok) for tok in toks if tok]
+            non_gen = [s for s in sks if s not in _generic_skels]
+            for s in (non_gen or sks):
+                if s:
+                    n_keys.add(s)
+        r_keys: set[str] = set()
+        for rl in cl.relative_names:
+            toks = canonicalize_person_name(rl)
+            sks = [_consonant_skeleton(tok) for tok in toks if tok]
+            non_gen = [s for s in sks if s not in _generic_skels]
+            for s in (non_gen or sks):
+                if s:
+                    r_keys.add(s)
+        v_keys: set[str] = set()
+        for vl in cl.villages:
+            for tok in canonicalize_place(vl).split():
+                sk = _consonant_skeleton(tok)
+                if sk:
+                    v_keys.add(sk)
+        return n_keys, r_keys, v_keys
+
     for _pass in range(3):
         cids_sorted = sorted(clusters.keys())
+        dob_index: dict[str, list[str]] = defaultdict(list)
+        name_rel_index: dict[tuple[str, str], list[str]] = defaultdict(list)
+        name_rel_no_aadhaar: dict[tuple[str, str], list[str]] = defaultdict(list)
+        name_vil_index: dict[tuple[str, str], list[str]] = defaultdict(list)
+        name_vil_no_aadhaar: dict[tuple[str, str], list[str]] = defaultdict(list)
+        cluster_keys: dict[str, tuple[set[str], set[str], set[str]]] = {}
+        has_aadhaar_cids: set[str] = set()
+        has_abha_cids: set[str] = set()
+        has_pan_cids: set[str] = set()
+        gender_cids: dict[str, set[str]] = defaultdict(set)
+
+        for cid in cids_sorted:
+            cl = clusters[cid]
+            has_aad = bool(cl.aadhaars)
+            if has_aad:
+                has_aadhaar_cids.add(cid)
+            if cl.abhas:
+                has_abha_cids.add(cid)
+            if cl.pans:
+                has_pan_cids.add(cid)
+            for g in cl.genders:
+                gender_cids[g].add(cid)
+            for d in cl.dobs:
+                dob_index[d].append(cid)
+            nk, rk, vk = _cluster_block_keys(cl)
+            cluster_keys[cid] = (nk, rk, vk)
+            for n1 in nk:
+                for r1 in rk:
+                    name_rel_index[(n1, r1)].append(cid)
+                    if not has_aad:
+                        name_rel_no_aadhaar[(n1, r1)].append(cid)
+                for v1 in vk:
+                    name_vil_index[(n1, v1)].append(cid)
+                    if not has_aad:
+                        name_vil_no_aadhaar[(n1, v1)].append(cid)
+
         merged_this_pass = False
         for cid_a in cids_sorted:
             if cid_a not in clusters:
                 continue
             ca = clusters[cid_a]
-            has_strong_a = bool(ca.mrns or ca.aadhaars or ca.abhas or ca.phones)
-            candidates: list[tuple[float, str]] = []
+            nk, rk, vk = cluster_keys[cid_a]
+            cand_cids: set[str] = set()
+            for d in ca.dobs:
+                cand_cids.update(dob_index[d])
+            nr_src = name_rel_no_aadhaar if ca.aadhaars else name_rel_index
+            nv_src = name_vil_no_aadhaar if ca.aadhaars else name_vil_index
+            for n1 in nk:
+                for r1 in rk:
+                    if (n1, r1) in nr_src:
+                        cand_cids.update(nr_src[(n1, r1)])
+                for v1 in vk:
+                    if (n1, v1) in nv_src:
+                        cand_cids.update(nv_src[(n1, v1)])
+            cand_cids.discard(cid_a)
+            if not cand_cids:
+                continue
+            # Fast conflict pruning: Stage 1 already merged identical aadhaar/abha/pan,
+            # so two clusters that both have aadhaar (or abha, or pan) cannot merge in Stage 2.
+            if ca.aadhaars:
+                cand_cids.difference_update(has_aadhaar_cids)
+            if ca.abhas:
+                cand_cids.difference_update(has_abha_cids)
+            if ca.pans:
+                cand_cids.difference_update(has_pan_cids)
+            if len(ca.genders) == 1:
+                g_a = next(iter(ca.genders))
+                for g_other, g_set in gender_cids.items():
+                    if g_other != g_a:
+                        cand_cids.difference_update(g_set)
 
-            for cid_b in sorted(clusters.keys()):
-                if cid_b <= cid_a and has_strong_a:
-                    # Still allow symmetric checks, but skip self
-                    pass
-                if cid_b == cid_a or cid_b not in clusters:
+            candidates: list[tuple[float, str]] = []
+            tie_20 = 0
+            tie_25 = 0
+            for cid_b in sorted(cand_cids):
+                if cid_b not in clusters:
                     continue
                 cb = clusters[cid_b]
                 if _has_hard_conflict(ca, cb, max_age_diff):
@@ -984,6 +1076,14 @@ def link_all_records(
 
                 if score > 0.0:
                     candidates.append((score, cid_b))
+                    if score >= 2.5:
+                        tie_25 += 1
+                    elif score >= 2.0:
+                        tie_20 += 1
+                    # Early exit: if no DOB and no relative match is possible and >=2 ambiguous name+village ties found,
+                    # line 997 will unconditionally reject merging cid_a.
+                    if not ca.dobs and not ca.relative_names and tie_25 == 0 and tie_20 >= 2:
+                        break
 
             if not candidates:
                 continue

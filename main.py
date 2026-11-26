@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import csv
+import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -14,9 +18,67 @@ import yaml
 from src.detection import PIIDetector
 from src.ingestion import IngestedFile, ingest_directory
 from src.linkage import RecordClues, extract_clues_from_file, infer_file_date_hints, link_all_records
-from src.privacy import build_privacy_profiles, sanitize_file
+from src.privacy import _sanitize_key_or_header, build_privacy_profiles, sanitize_csv_rows, sanitize_file
 from src.reporting import write_outputs
 from src.security import EncryptedVault, KeyRing, safe_reason, sanitize_filename
+
+_WORKER_DETECTOR: PIIDetector | None = None
+
+
+def _init_worker() -> None:
+    global _WORKER_DETECTOR
+    _WORKER_DETECTOR = PIIDetector()
+
+
+def _extract_clues_worker(args: tuple[IngestedFile, str, int]) -> list[RecordClues]:
+    inf, date_hint, modal_year = args
+    assert _WORKER_DETECTOR is not None
+    return extract_clues_from_file(inf, detector=_WORKER_DETECTOR, date_hint=date_hint, modal_year=modal_year)
+
+
+def _sanitize_csv_chunk_worker(
+    args: tuple[
+        str,
+        str,
+        list[str],
+        int | None,
+        list[list[str]],
+        int,
+        str,
+        int,
+        dict[str, RecordClues],
+        dict[str, str | None],
+        dict[str, Any],
+    ],
+) -> tuple[str, list[dict[str, Any]], dict[str, int], int]:
+    (
+        rel_path,
+        delimiter,
+        col_roles,
+        psn_col_idx,
+        rows_chunk,
+        start_row_idx,
+        date_hint,
+        modal_year,
+        clues_by_loc,
+        unit_to_psn,
+        unit_profiles,
+    ) = args
+    assert _WORKER_DETECTOR is not None
+    return sanitize_csv_rows(
+        rel_path=rel_path,
+        delimiter=delimiter,
+        col_roles=col_roles,
+        psn_col_idx=psn_col_idx,
+        rows_chunk=rows_chunk,
+        start_row_idx=start_row_idx,
+        date_hint=date_hint,
+        modal_year=modal_year,
+        clues_by_loc=clues_by_loc,
+        unit_to_psn=unit_to_psn,
+        unit_profiles=unit_profiles,
+        detector=_WORKER_DETECTOR,
+    )
 
 
 def load_policy(policy_path: Path) -> dict[str, Any]:
@@ -60,30 +122,33 @@ def main() -> int:
         max_file_bytes=int(policy.get("max_file_bytes", 104857600)),
     )
 
-    # Seal raw text snapshots inside AES-256-GCM memory vault and clear raw text until needed if desired
-    vault_tokens: dict[str, str] = {}
-    if vault is not None:
-        for inf in ingested_files:
-            if not inf.quarantine_reason and inf.text is not None:
-                vault_tokens[inf.rel_path] = vault.seal(inf.text.encode("utf-8"))
-
     # Pass 2: Dataset-wide date-hint & hospital consensus inference
     date_hints, modal_year = infer_file_date_hints(ingested_files)
 
-    # Pass 3: Clue Extraction
+    # Pass 3: Clue Extraction (parallelize across files when dataset is large)
     all_clues: list[RecordClues] = []
     clues_by_file: dict[str, list[RecordClues]] = {}
-    for inf in ingested_files:
-        if inf.quarantine_reason:
-            continue
-        f_clues = extract_clues_from_file(
-            inf,
-            detector=detector,
-            date_hint=date_hints.get(inf.rel_path, "dmy"),
-            modal_year=modal_year,
-        )
-        clues_by_file[inf.rel_path] = f_clues
-        all_clues.extend(f_clues)
+    valid_files = [inf for inf in ingested_files if not inf.quarantine_reason]
+    total_valid_bytes = sum(inf.raw_size for inf in valid_files)
+    n_workers = min(os.cpu_count() or 1, 8)
+    use_pool = n_workers > 1 and total_valid_bytes >= 500_000
+
+    if use_pool and len(valid_files) >= 2:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(n_workers, len(valid_files)), initializer=_init_worker) as ex:
+            tasks = [(inf, date_hints.get(inf.rel_path, "dmy"), modal_year) for inf in valid_files]
+            for inf, f_clues in zip(valid_files, ex.map(_extract_clues_worker, tasks)):
+                clues_by_file[inf.rel_path] = f_clues
+                all_clues.extend(f_clues)
+    else:
+        for inf in valid_files:
+            f_clues = extract_clues_from_file(
+                inf,
+                detector=detector,
+                date_hint=date_hints.get(inf.rel_path, "dmy"),
+                modal_year=modal_year,
+            )
+            clues_by_file[inf.rel_path] = f_clues
+            all_clues.extend(f_clues)
 
     # Pass 4: Conservative Cross-Script Record Linkage & HMAC Pseudonyms
     unit_to_psn, psn_clusters, ref_lookup = link_all_records(all_clues, keyring=keyring, policy=policy)
@@ -117,19 +182,92 @@ def main() -> int:
             if len(f_clues) == 1:
                 doc_psn = unit_to_psn.get(f_clues[0].unit_id)
 
-            sanitized_text, file_records = sanitize_file(
-                inf=inf,
-                date_hint=date_hints.get(inf.rel_path, "dmy"),
-                modal_year=modal_year,
-                clues_list=f_clues,
-                unit_to_psn=unit_to_psn,
-                unit_profiles=unit_profiles,
-                ref_lookup=ref_lookup,
-                detector=detector,
-                keyring=keyring,
-                entity_counts=entity_counts,
-                stats=stats,
-            )
+            if inf.fmt in ("csv", "tsv") and inf.data and len(inf.data) > 4001 and n_workers > 1:
+                rows = inf.data
+                header = list(rows[0])
+                body = rows[1:]
+                col_roles = [
+                    detector.classify_column_header(h, [r[i] for r in body[:25] if i < len(r)])
+                    for i, h in enumerate(header)
+                ]
+                used_headers: set[str] = set()
+                clean_header: list[str] = []
+                for h in header:
+                    ch, _ = _sanitize_key_or_header(h, detector, ref_lookup, keyring, used_headers, entity_counts)
+                    used_headers.add(ch)
+                    clean_header.append(ch)
+                psn_col_idx: int | None = None
+                for preferred in ("MRN", "PATIENT_NAME"):
+                    if preferred in col_roles:
+                        psn_col_idx = col_roles.index(preferred)
+                        break
+
+                h_buf = io.StringIO()
+                csv.writer(h_buf, delimiter=inf.delimiter or ",", lineterminator="\n").writerow(clean_header)
+                clues_by_loc = {rc.loc: rc for rc in f_clues}
+
+                chunk_size = max(2000, (len(body) + n_workers - 1) // n_workers)
+                chunk_tasks = []
+                for start in range(0, len(body), chunk_size):
+                    end = min(len(body), start + chunk_size)
+                    sub_clues: dict[str, RecordClues] = {}
+                    sub_u2p: dict[str, str | None] = {}
+                    sub_prof: dict[str, Any] = {}
+                    for r_i in range(start, end):
+                        loc = f"row:{r_i}"
+                        rc = clues_by_loc.get(loc)
+                        if rc is not None:
+                            sub_clues[loc] = rc
+                            uid = rc.unit_id
+                        else:
+                            uid = f"{inf.rel_path}|{loc}"
+                        if uid in unit_to_psn:
+                            sub_u2p[uid] = unit_to_psn[uid]
+                        if uid in unit_profiles:
+                            sub_prof[uid] = unit_profiles[uid]
+                    chunk_tasks.append((
+                        inf.rel_path,
+                        inf.delimiter or ",",
+                        col_roles,
+                        psn_col_idx,
+                        body[start:end],
+                        start,
+                        date_hints.get(inf.rel_path, "dmy"),
+                        modal_year,
+                        sub_clues,
+                        sub_u2p,
+                        sub_prof,
+                    ))
+
+                text_parts = [h_buf.getvalue()]
+                file_records: list[dict[str, Any]] = []
+                with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker) as ex:
+                    for c_text, c_recs, c_counts, c_gen in ex.map(_sanitize_csv_chunk_worker, chunk_tasks):
+                        text_parts.append(c_text)
+                        file_records.extend(c_recs)
+                        for k, v in c_counts.items():
+                            entity_counts[k] = entity_counts.get(k, 0) + v
+                        if c_gen:
+                            stats["records_generalized"] = stats.get("records_generalized", 0) + c_gen
+                sanitized_text = "".join(text_parts)
+            else:
+                sanitized_text, file_records = sanitize_file(
+                    inf=inf,
+                    date_hint=date_hints.get(inf.rel_path, "dmy"),
+                    modal_year=modal_year,
+                    clues_list=f_clues,
+                    unit_to_psn=unit_to_psn,
+                    unit_profiles=unit_profiles,
+                    ref_lookup=ref_lookup,
+                    detector=detector,
+                    keyring=keyring,
+                    entity_counts=entity_counts,
+                    stats=stats,
+                )
+
+            # Release raw parsed payload immediately after sanitization to bound memory
+            inf.data = None
+            inf.text = None
 
             clean_rel, was_renamed = sanitize_filename(
                 inf.rel_path,
@@ -150,7 +288,8 @@ def main() -> int:
 
             dest = san_dir / clean_rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(sanitized_text, encoding="utf-8", newline="")
+            with dest.open("w", encoding="utf-8", newline="") as f_out:
+                f_out.write(sanitized_text)
 
             entry.update(output=f"sanitized/{clean_rel}", status="sanitized")
             record_entries.extend(file_records)

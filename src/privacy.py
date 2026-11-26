@@ -332,11 +332,55 @@ def _sanitize_csv(
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=inf.delimiter or ",", lineterminator="\n")
     writer.writerow(clean_header)
+    chunk_text, chunk_records, chunk_counts, chunk_gen = sanitize_csv_rows(
+        rel_path=inf.rel_path,
+        delimiter=inf.delimiter or ",",
+        col_roles=col_roles,
+        psn_col_idx=psn_col_idx,
+        rows_chunk=body,
+        start_row_idx=0,
+        date_hint=date_hint,
+        modal_year=modal_year,
+        clues_by_loc=clues_by_loc,
+        unit_to_psn=unit_to_psn,
+        unit_profiles=unit_profiles,
+        detector=detector,
+    )
+    for k, v in chunk_counts.items():
+        entity_counts[k] = entity_counts.get(k, 0) + v
+    if chunk_gen:
+        stats["records_generalized"] = stats.get("records_generalized", 0) + chunk_gen
+    records_out.extend(chunk_records)
+    return buf.getvalue() + chunk_text
 
-    for r_idx, row in enumerate(body):
+
+def sanitize_csv_rows(
+    rel_path: str,
+    delimiter: str,
+    col_roles: list[str],
+    psn_col_idx: int | None,
+    rows_chunk: list[list[str]],
+    start_row_idx: int,
+    date_hint: str,
+    modal_year: int,
+    clues_by_loc: dict[str, RecordClues],
+    unit_to_psn: dict[str, str | None],
+    unit_profiles: dict[str, PrivacyProfile],
+    detector: PIIDetector,
+) -> tuple[str, list[dict[str, Any]], dict[str, int], int]:
+    """Sanitize a slice of CSV/TSV body rows and return (csv_text, records, entity_counts, generalized_count)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
+    cell_spans_cache: dict[tuple[str, bool], list[Any]] = {}
+    entity_counts: dict[str, int] = {}
+    records_out: list[dict[str, Any]] = []
+    generalized_count = 0
+
+    for offset, row in enumerate(rows_chunk):
+        r_idx = start_row_idx + offset
         loc = f"row:{r_idx}"
         rc = clues_by_loc.get(loc)
-        uid = rc.unit_id if rc else f"{inf.rel_path}|{loc}"
+        uid = rc.unit_id if rc else f"{rel_path}|{loc}"
         psn = unit_to_psn.get(uid)
         prof = unit_profiles.get(uid)
         extra_pat = rc.patient_names if rc else []
@@ -443,14 +487,58 @@ def _sanitize_csv(
                     continue
 
                 if role in ("ADDRESS", "FREE_TEXT", "OTHER"):
-                    # In ADDRESS or FREE_TEXT or general cells, run full contextual detector + district generalization
-                    txt_clean = detector.redact_text(
-                        val,
-                        extra_patient_names=extra_pat,
-                        extra_relative_names=extra_rel,
-                        allow_pin_scan=(role == "ADDRESS"),
-                        entity_counts=entity_counts,
-                    )
+                    if not val or not val.strip():
+                        clean_row.append(val)
+                        continue
+                    allow_pin = (role == "ADDRESS")
+                    # Fast path: if no extra_pat/extra_rel token appears in val, reuse cached base spans
+                    has_extra_hit = False
+                    if extra_pat or extra_rel:
+                        val_low = val.lower()
+                        for nm in extra_pat:
+                            for tok in nm.split():
+                                if len(tok) >= 3 and tok.lower() in val_low:
+                                    has_extra_hit = True
+                                    break
+                            if has_extra_hit:
+                                break
+                        if not has_extra_hit:
+                            for nm in extra_rel:
+                                for tok in nm.split():
+                                    if len(tok) >= 3 and tok.lower() in val_low:
+                                        has_extra_hit = True
+                                        break
+                                if has_extra_hit:
+                                    break
+
+                    if not has_extra_hit:
+                        ckey = (val, allow_pin)
+                        cached_spans = cell_spans_cache.get(ckey)
+                        if cached_spans is None:
+                            cached_spans = detector.detect_text(val, allow_pin_scan=allow_pin)
+                            if len(cell_spans_cache) < 65536:
+                                cell_spans_cache[ckey] = cached_spans
+                        if not cached_spans:
+                            txt_clean = val
+                        else:
+                            out_parts = []
+                            cur = 0
+                            for sp in cached_spans:
+                                out_parts.append(val[cur:sp.start])
+                                entity_counts[sp.pii_type] = entity_counts.get(sp.pii_type, 0) + 1
+                                out_parts.append(f"{sp.surface[:3]}***" if sp.pii_type == "PIN" else f"[{sp.pii_type}]")
+                                cur = sp.end
+                            out_parts.append(val[cur:])
+                            txt_clean = "".join(out_parts)
+                    else:
+                        # In ADDRESS or FREE_TEXT or general cells, run full contextual detector + district generalization
+                        txt_clean = detector.redact_text(
+                            val,
+                            extra_patient_names=extra_pat,
+                            extra_relative_names=extra_rel,
+                            allow_pin_scan=allow_pin,
+                            entity_counts=entity_counts,
+                        )
                     if role == "ADDRESS" and prof and prof.generalize_district and rc and rc.district:
                         txt_clean = re.sub(re.escape(rc.district), prof.state_label, txt_clean, flags=re.I)
                     clean_row.append(txt_clean)
@@ -460,15 +548,15 @@ def _sanitize_csv(
 
         writer.writerow(clean_row)
         if generalized_any:
-            stats["records_generalized"] = stats.get("records_generalized", 0) + 1
+            generalized_count += 1
         records_out.append({
-            "file": f"sanitized/{inf.rel_path}",
+            "file": f"sanitized/{rel_path}",
             "loc": loc,
             "patient": psn,
             **({"status": "generalized"} if generalized_any else {}),
         })
 
-    return buf.getvalue()
+    return buf.getvalue(), records_out, entity_counts, generalized_count
 
 
 # --------------------------------------------------------------------------- JSON (Non-FHIR) Sanitizer

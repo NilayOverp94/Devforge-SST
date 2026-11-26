@@ -25,7 +25,7 @@ linkage_require_corroboration_for_name: true
 
 # Ingestion & fail-safe quarantine bounds
 max_json_depth: 200
-max_file_bytes: 104857600       # 100 MB guard per file
+max_file_bytes: 4294967296      # 4 GB guard per file
 
 # Security & at-rest vault
 encrypt_intermediate_vault: true
