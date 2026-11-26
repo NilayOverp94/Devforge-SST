@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Raksha Kavach &middot; Clinical Privacy Firewall Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Left Navigation Rail -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L4 5v6.09c0 5.05 3.41 9.76 8 10.91 4.59-1.15 8-5.86 8-10.91V5l-8-3z"/>
+            <path d="M9 12l2 2 4-4"/>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">Raksha Kavach</div>
+          <div class="brand-sub">Track 3 &middot; Secret Wards</div>
+        </div>
+      </div>
+
+      <nav class="nav-list" aria-label="Primary Navigation">
+        <button class="nav-btn active" data-tab="overview">
+          <span class="nav-icon">&#9635;</span> Run &amp; Audit Overview
+        </button>
+        <button class="nav-btn" data-tab="files">
+          <span class="nav-icon">&#9776;</span> File Audit &amp; Quarantine
+        </button>
+        <button class="nav-btn" data-tab="linkage">
+          <span class="nav-icon">&#8644;</span> Identity Linkage
+        </button>
+        <button class="nav-btn" data-tab="inspector">
+          <span class="nav-icon">&#9998;</span> Document Inspector
+        </button>
+        <button class="nav-btn" data-tab="sandbox">
+          <span class="nav-icon">&#9881;</span> Live Multilingual Sandbox
+        </button>
+        <button class="nav-btn" data-tab="policy">
+          <span class="nav-icon">&#10003;</span> Policy &amp; Verification
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="compliance-pill"><span class="dot"></span> 100% Offline &middot; CPU-Only</div>
+        <div class="compliance-meta">Zero LLMs &middot; AES-256-GCM Vault<br>HKDF + HMAC-SHA256 Pseudonyms</div>
+      </div>
+    </aside>
+
+    <!-- Main Workspace -->
+    <main class="main-area">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Run &amp; Executive Audit Overview</h1>
+          <p id="page-subtitle" class="subtitle">Ingest heterogeneous clinical exports, enforce privacy policy, and inspect release integrity.</p>
+        </div>
+        <div class="topbar-status">
+          <span id="health-badge" class="badge badge-neutral">Checking engine...</span>
+          <button id="btn-top-run" class="btn btn-primary">Execute Firewall</button>
+        </div>
+      </header>
+
+      <!-- TAB 1: Run & Audit Overview -->
+      <section id="tab-overview" class="tab-panel active">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2>Pipeline Input &amp; Execution</h2>
+              <span class="hint">Processed 100% locally on 127.0.0.1; staged upload bytes are purged immediately after sanitization.</span>
+            </div>
+            <div class="seg-control" role="tablist" aria-label="Input source mode">
+              <button id="btn-mode-upload" type="button" class="seg-btn active" data-mode="upload">Select Files / Folder</button>
+              <button id="btn-mode-path" type="button" class="seg-btn" data-mode="path">Local Folder Path</button>
+            </div>
+          </div>
+
+          <!-- Source Mode A: Direct File / Folder Picker + Drag & Drop -->
+          <div id="source-upload-panel" class="source-panel">
+            <input id="pick-files" type="file" multiple hidden>
+            <input id="pick-folder" type="file" webkitdirectory directory multiple hidden>
+            <div id="drop-zone" class="drop-zone" tabindex="0">
+              <div class="drop-icon" aria-hidden="true">&#8682;</div>
+              <div class="drop-title">Drop hospital files or a whole folder here</div>
+              <div class="drop-sub">Supports CSV, TSV, JSON, FHIR R4 Bundles, and TXT across English, Hindi (Devanagari), and Hinglish</div>
+              <div class="drop-actions">
+                <button id="btn-pick-files" type="button" class="btn btn-primary btn-sm">Choose Files&hellip;</button>
+                <button id="btn-pick-folder" type="button" class="btn btn-secondary btn-sm">Choose Folder&hellip;</button>
+                <button id="btn-clear-files" type="button" class="btn btn-ghost btn-sm hidden">Clear Selection</button>
+              </div>
+            </div>
+            <div id="selected-files-box" class="selected-box hidden">
+              <div id="selected-files-summary" class="selected-summary"></div>
+              <div id="selected-files-list" class="selected-list"></div>
+            </div>
+          </div>
+
+          <!-- Source Mode B: Direct Local Directory Path -->
+          <div id="source-path-panel" class="source-panel hidden">
+            <div class="field" style="margin-bottom:12px;">
+              <label for="inp-dir">Local Input Directory Path (Read-Only)</label>
+              <div class="secret-wrap">
+                <input id="inp-dir" type="text" placeholder="/path/to/hospital_records">
+                <button id="btn-use-dev" type="button" class="btn btn-secondary btn-sm hidden">Use Practice Dataset</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-grid form-grid-2">
+            <div class="field">
+              <label for="out-dir">Output Release Directory</label>
+              <input id="out-dir" type="text" placeholder="/path/to/output">
+            </div>
+            <div class="field">
+              <label for="secret-key">RAKSHA_SECRET (Per-Release Key)</label>
+              <div class="secret-wrap">
+                <input id="secret-key" type="password" value="practice" autocomplete="off">
+                <button id="btn-toggle-secret" type="button" class="btn btn-ghost btn-sm">Show</button>
+              </div>
+            </div>
+          </div>
+          <div class="run-actions">
+            <div class="stages" id="pipeline-stages">
+              <span class="stage" data-s="1">1. Ingestion &amp; Quarantine</span>
+              <span class="stage" data-s="2">2. Multilingual NER &amp; Guards</span>
+              <span class="stage" data-s="3">3. Cross-Script Linkage</span>
+              <span class="stage" data-s="4">4. Privacy Layer</span>
+              <span class="stage" data-s="5">5. Export &amp; Audit</span>
+            </div>
+            <div class="btn-group">
+              <button id="btn-load-existing" type="button" class="btn btn-secondary">Load Existing Output</button>
+              <button id="btn-download-zip" type="button" class="btn btn-secondary" disabled>Download Sanitized (.zip)</button>
+              <button id="btn-run-firewall" type="button" class="btn btn-primary">Run Firewall Pipeline</button>
+            </div>
+          </div>
+          <div id="run-banner" class="banner hidden"></div>
+        </div>
+
+        <!-- KPI Metrics -->
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">Total Files</div>
+            <div id="kpi-total" class="kpi-val">&mdash;</div>
+            <div id="kpi-sub-files" class="kpi-sub">Awaiting run</div>
+          </div>
+          <div class="kpi-card kpi-ok">
+            <div class="kpi-label">Sanitized</div>
+            <div id="kpi-sanitized" class="kpi-val">&mdash;</div>
+            <div class="kpi-sub">UTF-8 verified exports</div>
+          </div>
+          <div class="kpi-card kpi-warn">
+            <div class="kpi-label">Quarantined</div>
+            <div id="kpi-quarantined" class="kpi-val">&mdash;</div>
+            <div class="kpi-sub">Never copied raw</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Identifiers Redacted</div>
+            <div id="kpi-identifiers" class="kpi-val">&mdash;</div>
+            <div id="kpi-sub-records" class="kpi-sub">Across all channels</div>
+          </div>
+          <div class="kpi-card kpi-teal">
+            <div class="kpi-label">Patient Clusters</div>
+            <div id="kpi-clusters" class="kpi-val">&mdash;</div>
+            <div id="kpi-sub-linked" class="kpi-sub">Cross-script HMAC IDs</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Generalized Records</div>
+            <div id="kpi-generalized" class="kpi-val">&mdash;</div>
+            <div class="kpi-sub">Age bands / location / shifts</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Execution Time</div>
+            <div id="kpi-time" class="kpi-val">&mdash;</div>
+            <div class="kpi-sub">Limit: 900s (2 CPUs)</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Peak Memory</div>
+            <div id="kpi-rss" class="kpi-val">&mdash;</div>
+            <div class="kpi-sub">Limit: 4,096 MB RSS</div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h2>Detected PII Distribution (report.json)</h2>
+              <span class="hint">Counts only &mdash; zero raw PII stored</span>
+            </div>
+            <div id="entity-chart" class="chart-box">
+              <div class="empty-state">Run the firewall or load an existing output directory to view entity metrics.</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>Fail-Safe Quarantine Breakdown</h2>
+              <span class="hint">Malformed / unsupported files isolated</span>
+            </div>
+            <div id="quarantine-summary" class="chart-box">
+              <div class="empty-state">No quarantined files loaded yet.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: File Audit & Quarantine -->
+      <section id="tab-files" class="tab-panel">
+        <div class="card">
+          <div class="card-header">
+            <h2>Release File Manifest (SHA-256 Identified)</h2>
+            <div class="toolbar">
+              <input id="file-search" type="search" placeholder="Filter by SHA-256, output path, or reason...">
+              <select id="file-status-filter">
+                <option value="all">All Statuses</option>
+                <option value="sanitized">Sanitized Only</option>
+                <option value="quarantined">Quarantined Only</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Input SHA-256</th>
+                  <th>Status</th>
+                  <th>Output Path (in sanitized/)</th>
+                  <th>Quarantine Reason</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="files-tbody">
+                <tr><td colspan="6" class="empty-cell">No release loaded yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: Identity Linkage Explorer -->
+      <section id="tab-linkage" class="tab-panel">
+        <div class="two-col linkage-grid">
+          <div class="card">
+            <div class="card-header">
+              <h2>Pseudonym Clusters (records.jsonl)</h2>
+              <input id="cluster-search" type="search" placeholder="Search PSN-XXXXXX or file...">
+            </div>
+            <div id="cluster-summary-bar" class="summary-strip"></div>
+            <div id="cluster-list" class="scroll-list">
+              <div class="empty-state">No linkage data loaded yet.</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h2 id="cluster-detail-title">Cluster Membership</h2>
+              <span class="hint">Records sharing a single non-reversible HMAC pseudonym</span>
+            </div>
+            <div id="cluster-detail-body" class="scroll-list">
+              <div class="empty-state">Select a pseudonym cluster on the left to inspect linked files and record locators.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: Document Inspector -->
+      <section id="tab-inspector" class="tab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2>Sanitized Output Inspector</h2>
+              <span id="inspector-meta" class="hint">Select a file from File Audit or Linkage Explorer.</span>
+            </div>
+            <div class="toolbar">
+              <label class="checkbox-pill">
+                <input id="chk-compare-raw" type="checkbox">
+                <span>Compare Raw Input (Authorized Local Review)</span>
+              </label>
+              <button id="btn-reload-doc" class="btn btn-secondary btn-sm">Refresh</button>
+            </div>
+          </div>
+          <div id="inspector-grid" class="inspector-single">
+            <div class="pane">
+              <div class="pane-title">Sanitized Release File (UTF-8)</div>
+              <div id="sanitized-view" class="code-viewer">
+                <div class="empty-state">No file selected.</div>
+              </div>
+            </div>
+            <div id="raw-pane" class="pane hidden">
+              <div class="pane-title pane-title-warn">Original Raw Input (Contains Synthetic PII &mdash; Local Only)</div>
+              <pre id="raw-view" class="code-pre"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: Live Multilingual Sandbox -->
+      <section id="tab-sandbox" class="tab-panel">
+        <div class="card">
+          <div class="card-header">
+            <h2>Live Multilingual De-identification Sandbox</h2>
+            <div class="toolbar">
+              <button class="btn btn-ghost btn-sm preset-btn" data-preset="hindi">Hindi + Hinglish Trap</button>
+              <button class="btn btn-ghost btn-sm preset-btn" data-preset="meaning">Meaning Traps (Dr/C/O/Eponym)</button>
+              <button class="btn btn-ghost btn-sm preset-btn" data-preset="whatsapp">WhatsApp + Canary</button>
+              <button class="btn btn-ghost btn-sm preset-btn" data-preset="json">JSON + Base64</button>
+            </div>
+          </div>
+          <div class="sandbox-controls">
+            <div class="field-inline">
+              <label for="sbx-format">Format</label>
+              <select id="sbx-format">
+                <option value="text">Free Text (.txt)</option>
+                <option value="csv">CSV (.csv)</option>
+                <option value="json">JSON (.json)</option>
+              </select>
+            </div>
+            <div class="field-inline">
+              <label for="sbx-secret">Test Secret</label>
+              <input id="sbx-secret" type="text" value="practice">
+            </div>
+            <button id="btn-run-sandbox" class="btn btn-primary">Sanitize Snippet</button>
+          </div>
+          <textarea id="sbx-input" class="sbx-textarea" rows="8" placeholder="Paste synthetic English, Hindi (Devanagari), Hinglish text, CSV, or JSON here..."></textarea>
+
+          <div class="two-col sbx-results">
+            <div class="pane">
+              <div class="pane-title">
+                Detected PII vs. Preserved Clinical Guards
+                <span class="legend">
+                  <span class="tag-pii">Redacted PII</span>
+                  <span class="tag-prot">Protected Clinical</span>
+                </span>
+              </div>
+              <div id="sbx-annotated" class="annotated-box">
+                <div class="empty-state">Click "Sanitize Snippet" to inspect span-level detection and clinical guards.</div>
+              </div>
+            </div>
+            <div class="pane">
+              <div class="pane-title">Sanitized Output &amp; Assigned Pseudonym</div>
+              <pre id="sbx-output" class="code-pre"></pre>
+            </div>
+          </div>
+          <div id="sbx-meta" class="summary-strip"></div>
+        </div>
+      </section>
+
+      <!-- TAB 6: Policy & Verification -->
+      <section id="tab-policy" class="tab-panel">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h2>Privacy Policy Rules (config/policy.yaml)</h2>
+              <button id="btn-save-policy" class="btn btn-primary btn-sm">Save Policy</button>
+            </div>
+            <div id="policy-form" class="policy-grid"></div>
+            <div id="policy-banner" class="banner hidden"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>Verification &amp; Compliance Suite</h2>
+              <span class="hint">Run toolkit validators &amp; unseen-chaos checks</span>
+            </div>
+            <div class="verify-buttons">
+              <button class="btn btn-secondary verify-btn" data-kind="validate">Validate Output Contract</button>
+              <button class="btn btn-secondary verify-btn" data-kind="check_dev">Run check_dev.py (Practice)</button>
+              <button class="btn btn-secondary verify-btn" data-kind="eval_attacks">Simulate Attack Arena (A3/A4/A5)</button>
+              <button class="btn btn-secondary verify-btn" data-kind="chaos">Run Unseen Chaos Test</button>
+              <button class="btn btn-primary verify-btn" data-kind="check_submission">Run check_submission.py (3 Runs)</button>
+            </div>
+            <div id="verify-status" class="summary-strip">Click a check above to run against the current configuration/output.</div>
+            <pre id="verify-output" class="terminal-pre">Ready.</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

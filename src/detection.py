@@ -980,8 +980,10 @@ class PIIDetector:
             return "AGE"
         if any(k in tokens for k in ("gender", "sex", "ling", "linga")):
             return "GENDER"
-        if any(k in h_clean for k in ("village", "gaon", "gaav", "gram", "city", "mohalla")):
+        if any(k in h_clean for k in ("village", "gaon", "gaav", "gram", "city")):
             return "VILLAGE"
+        if any(k in h_clean for k in ("mohalla", "locality", "colony", "basti")):
+            return "LOCALITY"
         if "tehsil" in h_clean or "taluka" in h_clean or "block" in tokens:
             return "TEHSIL"
         if any(k in h_clean for k in ("district", "jila", "zila", "distt")) or "dist" in tokens:

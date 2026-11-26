@@ -43,6 +43,26 @@ Using `raksha.toml`:
 - `setup = "pip install -r requirements.txt"`
 - `run = "python main.py --input {input} --output {output}"`
 
+### Compliance Console GUI (100% Offline, Localhost Only)
+
+Launch the built-in zero-dependency clinical-compliance web console (`http.server` on `127.0.0.1`, no external CDNs, no extra packages):
+
+```bash
+.venv/bin/python gui.py --port 8573
+```
+
+Pass `--no-browser` to start the local server without opening a browser tab automatically. If `8573` is already in use, the server automatically increments to the next free localhost port.
+
+**Console Views & Capabilities:**
+1. **Run & Audit Overview:** Directly **Choose Files / Choose Folder** (or drag-and-drop into the console) or specify a local read-only folder path, enter an ephemeral `RAKSHA_SECRET` (kept strictly in process memory/env for that run, never persisted or logged), run the firewall, download the sanitized ZIP bundle, and inspect entity-detection and quarantine charts.
+2. **File Audit & Quarantine:** Search the SHA-256 file manifest, filter sanitized vs. quarantined files, and inspect quarantine reasons without touching input data.
+3. **Identity Linkage:** Browse assigned patient clusters (`PSN-XXXXXX`), linked source records, and conservative unlinked (`null`) records.
+4. **Document Inspector:** Compare sanitized records cleanly alongside optional raw input inspection protected by strict path-containment checks (`is_relative_to`).
+5. **Live Multilingual Sandbox:** Test English, Devanagari, Hinglish, meaning-trap, and malformed-input samples interactively with PII vs. clinical-protected span highlighting.
+6. **Policy & Verification:** Review/update `config/policy.yaml` rules and trigger offline checks (`validate_output.py`, `check_dev.py`, `tests/test_chaos.py`, `check_submission.py`) directly from the UI.
+
+**Security Model:** The HTTP server binds exclusively to loopback (`127.0.0.1`), suppresses HTTP request access logs (`log_message` silenced) to prevent PII or path leakage, validates file reads strictly inside the authorized directories, and keeps `RAKSHA_SECRET` out of disk files, audit reports, and responses.
+
 ---
 
 ## 3. Core Pipeline Components

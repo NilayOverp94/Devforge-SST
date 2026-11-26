@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 .test_out/
+.gui_output/
 .DS_Store
 out/
