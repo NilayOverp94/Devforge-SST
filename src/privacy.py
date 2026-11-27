@@ -34,7 +34,7 @@ from .linkage import (
 from .security import KeyRing
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class PrivacyProfile:
     date_shift: int
     age_band_width: int
@@ -67,6 +67,29 @@ def build_privacy_profiles(
     gen_rare_dist = bool(policy.get("generalize_rare_district", True))
     state_label = str(policy.get("default_state_label", "Uttar Pradesh"))
 
+    # Intern PrivacyProfile objects to cap distinct instances (~700 total vs millions)
+    prof_intern: dict[tuple[int, int, int, bool, int, bool, str, bool], PrivacyProfile] = {}
+
+    def _get_prof(shift: int, elevated: bool) -> PrivacyProfile:
+        gen_dist = gen_rare_dist and elevated
+        age_w = rare_band if elevated else std_band
+        pin_d = 0 if gen_dist else pin_digits
+        pkey = (shift, age_w, elderly_cap, gen_dist, pin_d, suppress_dob, state_label, elevated)
+        res = prof_intern.get(pkey)
+        if res is None:
+            res = PrivacyProfile(
+                date_shift=shift,
+                age_band_width=age_w,
+                elderly_cap=elderly_cap,
+                generalize_district=gen_dist,
+                pin_prefix_digits=pin_d,
+                suppress_dob=suppress_dob,
+                state_label=state_label,
+                elevated_risk=elevated,
+            )
+            prof_intern[pkey] = res
+        return res
+
     # 1. Condition/procedure patient frequency across clusters
     cond_patients: dict[str, set[str]] = defaultdict(set)
     for psn, cl in psn_clusters.items():
@@ -76,11 +99,17 @@ def build_privacy_profiles(
     rare_conditions = {d for d, pts in cond_patients.items() if len(pts) <= rare_cond_th}
 
     # 2. Cohort cell counts on (district, gender, base_age_band)
-    def _cell_key(cl: PatientCluster) -> tuple[str, str, int]:
-        dist = canonicalize_place(cl.districts[0]) if cl.districts else ""
-        gen = sorted(cl.genders)[0] if cl.genders else ""
-        if cl.ages:
-            a = max(0, cl.ages[0])
+    def _cell_key(cl: Any) -> tuple[str, str, int]:
+        if isinstance(cl, RecordClues):
+            dist = canonicalize_place(cl.district) if cl.district else ""
+            gen = cl.gender
+            fa = cl.age
+        else:
+            dist = canonicalize_place(cl.districts[0]) if cl.districts else ""
+            gen = min(cl.genders) if cl.genders else ""
+            fa = cl.first_age
+        if fa is not None:
+            a = max(0, fa)
             b = elderly_cap if a >= elderly_cap else (a // std_band) * std_band
         else:
             b = -1
@@ -90,25 +119,25 @@ def build_privacy_profiles(
 
     psn_profiles: dict[str, PrivacyProfile] = {}
     for psn, cl in psn_clusters.items():
-        ckey = cl.canonical_key()
+        ckey = cl.canonical_key() if hasattr(cl, "canonical_key") else ""
+        if not ckey:
+            for s in (cl.aadhaars, cl.abhas, cl.mrns, cl.phones, cl.pans, cl.emails):
+                if s:
+                    ckey = f"id:{min(s)}"
+                    break
+            else:
+                ckey = f"bio:rc|{cl.dob}|{cl.unit_id}"
         shift = keyring.date_shift_days(ckey, min_days=min_shift, max_days=max_shift)
-        has_rare = bool(cl.diagnoses & rare_conditions)
-        has_elderly = any(a >= elderly_cap for a in cl.ages)
-        has_ped = any(a <= ped_max for a in cl.ages)
+        has_rare = bool(cl.diagnoses) and not rare_conditions.isdisjoint(cl.diagnoses)
+        if isinstance(cl, RecordClues):
+            has_elderly = cl.age is not None and cl.age >= elderly_cap
+            has_ped = cl.age is not None and cl.age <= ped_max
+        else:
+            has_elderly = any(a >= elderly_cap for a in cl.ages)
+            has_ped = any(a <= ped_max for a in cl.ages)
         small_cell = cell_counts[_cell_key(cl)] < min_k
         elevated = has_rare or has_elderly or (has_ped and small_cell) or small_cell
-        gen_dist = gen_rare_dist and elevated
-
-        psn_profiles[psn] = PrivacyProfile(
-            date_shift=shift,
-            age_band_width=rare_band if elevated else std_band,
-            elderly_cap=elderly_cap,
-            generalize_district=gen_dist,
-            pin_prefix_digits=0 if gen_dist else pin_digits,
-            suppress_dob=suppress_dob,
-            state_label=state_label,
-            elevated_risk=elevated,
-        )
+        psn_profiles[psn] = _get_prof(shift, elevated)
 
     unit_profiles: dict[str, PrivacyProfile] = {}
     for rc in all_clues:
@@ -117,20 +146,10 @@ def build_privacy_profiles(
             unit_profiles[rc.unit_id] = psn_profiles[psn]
         else:
             shift = keyring.date_shift_days(f"unit|{rc.unit_id}", min_days=min_shift, max_days=max_shift)
-            has_rare = bool(rc.diagnoses & rare_conditions)
+            has_rare = bool(rc.diagnoses) and not rare_conditions.isdisjoint(rc.diagnoses)
             has_elderly = rc.age is not None and rc.age >= elderly_cap
             elevated = has_rare or has_elderly
-            gen_dist = gen_rare_dist and elevated
-            unit_profiles[rc.unit_id] = PrivacyProfile(
-                date_shift=shift,
-                age_band_width=rare_band if elevated else std_band,
-                elderly_cap=elderly_cap,
-                generalize_district=gen_dist,
-                pin_prefix_digits=0 if gen_dist else pin_digits,
-                suppress_dob=suppress_dob,
-                state_label=state_label,
-                elevated_risk=elevated,
-            )
+            unit_profiles[rc.unit_id] = _get_prof(shift, elevated)
 
     return psn_profiles, unit_profiles
 
@@ -540,7 +559,7 @@ def sanitize_csv_rows(
                             allow_pin_scan=allow_pin,
                             entity_counts=entity_counts,
                         )
-                    if role == "ADDRESS" and prof and prof.generalize_district and rc and rc.district:
+                    if role == "ADDRESS" and prof and prof.generalize_district and rc and rc.district and rc.district.lower() in txt_clean.lower():
                         txt_clean = re.sub(re.escape(rc.district), prof.state_label, txt_clean, flags=re.I)
                     clean_row.append(txt_clean)
                     continue
@@ -564,7 +583,7 @@ def sanitize_csv_rows(
 
 def _clean_json_node(
     node: Any,
-    path_parts: list[str],
+    path_parts: list[str] | tuple[str, str],
     rc: RecordClues | None,
     psn: str | None,
     prof: PrivacyProfile | None,
@@ -578,26 +597,39 @@ def _clean_json_node(
     entity_counts: dict[str, int],
     str_spans_cache: dict[tuple[str, bool], list[Any]],
 ) -> Any:
+    if isinstance(path_parts, tuple):
+        leaf_key, parent_key = path_parts
+    else:
+        leaf_key = path_parts[-1] if path_parts else ""
+        parent_key = path_parts[-2] if len(path_parts) >= 2 else ""
+
     if isinstance(node, dict):
         used_k: set[str] = set()
         out_d: dict[str, Any] = {}
+        has_ref = bool(ref_lookup)
         for k, v in node.items():
-            sk, key_changed = _sanitize_key_or_header(str(k), detector, ref_lookup, keyring, used_k, entity_counts)
+            ks = str(k)
+            if has_ref:
+                sk, key_changed = _sanitize_key_or_header(ks, detector, ref_lookup, keyring, used_k, entity_counts)
+            else:
+                # Even without ref_lookup, still redact PII tokens inside keys if detected
+                sk, key_changed = _sanitize_key_or_header(ks, detector, ref_lookup, keyring, used_k, entity_counts)
             used_k.add(sk)
-            if key_changed and isinstance(v, str) and norm_mrn_key(v) in ref_lookup:
+            if key_changed and isinstance(v, str) and has_ref and norm_mrn_key(v) in ref_lookup:
                 entity_counts["MRN"] = entity_counts.get("MRN", 0) + 1
                 out_d[sk] = ref_lookup[norm_mrn_key(v)]
             else:
                 out_d[sk] = _clean_json_node(
-                    v, path_parts + [str(k).lower()], rc, psn, prof, psn_injected, gen_flag,
+                    v, (ks.lower(), leaf_key), rc, psn, prof, psn_injected, gen_flag,
                     date_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_spans_cache,
                 )
         return out_d
 
     if isinstance(node, list):
+        sub_path = (leaf_key, parent_key)
         return [
             _clean_json_node(
-                x, path_parts, rc, psn, prof, psn_injected, gen_flag,
+                x, sub_path, rc, psn, prof, psn_injected, gen_flag,
                 date_hint, modal_year, detector, ref_lookup, keyring, entity_counts, str_spans_cache,
             )
             for x in node
@@ -606,10 +638,8 @@ def _clean_json_node(
     if node is None or isinstance(node, bool):
         return node
 
-    leaf_key = path_parts[-1] if path_parts else ""
-    parent_key = path_parts[-2] if len(path_parts) >= 2 else ""
-    extra_pat = rc.patient_names if rc else []
-    extra_rel = rc.relative_names if rc else []
+    extra_pat = rc.patient_names if rc else ()
+    extra_rel = rc.relative_names if rc else ()
 
     # Metadata path keys (e.g. _export_meta.source_path)
     if leaf_key in ("source_path", "filepath", "file_path", "export_path"):
@@ -799,7 +829,7 @@ def _clean_json_node(
                 allow_pin_scan=allow_pin,
                 entity_counts=entity_counts,
             )
-        if allow_pin and prof and prof.generalize_district and rc and rc.district:
+        if allow_pin and prof and prof.generalize_district and rc and rc.district and rc.district.lower() in cleaned.lower():
             cleaned = re.sub(re.escape(rc.district), prof.state_label, cleaned, flags=re.I)
         return cleaned
 
@@ -976,16 +1006,18 @@ def _sanitize_fhir(
     entity_counts: dict[str, int],
     stats: dict[str, int],
     records_out: list[dict[str, Any]],
+    mutate_in_place: bool = False,
 ) -> str:
-    bundle = copy.deepcopy(inf.data)
+    bundle = inf.data if mutate_in_place else copy.deepcopy(inf.data)
     rel = inf.rel_path
     rc = clues_by_loc.get("doc")
     uid = rc.unit_id if rc else f"{rel}|doc"
     psn = unit_to_psn.get(uid)
     prof = unit_profiles.get(uid)
     shift_days = prof.date_shift if prof else 0
-    extra_pat = rc.patient_names if rc else []
-    extra_rel = rc.relative_names if rc else []
+    extra_pat = rc.patient_names if (rc and len(rc.patient_names) <= 200) else ()
+    extra_rel = rc.relative_names if (rc and len(rc.relative_names) <= 200) else ()
+    local_prop = bool(rc and (len(rc.patient_names) > 200 or len(rc.relative_names) > 200))
     pid_label = psn if psn else "[PATIENT]"
     generalized_any = False
 
@@ -1113,6 +1145,7 @@ def _sanitize_fhir(
                             allow_pin_scan=False,
                             pseudonym=psn,
                             entity_counts=entity_counts,
+                            local_propagate=local_prop,
                         )
                         att["data"] = encode_base64_text(cleaned_dec)
 
@@ -1192,23 +1225,25 @@ def preprocess_text_doc(
             generalized_any = True
             return f"{m.group(1)}{format_age_band(age_val, prof)}{m.group(3)}"
 
-        work = _RX_TEXT_AGE.sub(_age_sub, work)
-        work = _RX_TEXT_AGE_INLINE.sub(
-            lambda m: (lambda b: f"{b}{m.group(2)}")(format_age_band(int(to_ascii_digits(m.group(1))), prof)),
-            work,
-        )
-        if _RX_TEXT_AGE_INLINE.search(text):
+        def _age_inline_sub(m: re.Match) -> str:
+            nonlocal generalized_any
+            age_val = int(to_ascii_digits(m.group(1)))
             generalized_any = True
+            return f"{format_age_band(age_val, prof)}{m.group(2)}"
+
+        work = _RX_TEXT_AGE.sub(_age_sub, work)
+        work = _RX_TEXT_AGE_INLINE.sub(_age_inline_sub, work)
 
     return work, generalized_any
 
 
 def redact_text_chunk(
     chunk: str,
-    extra_pat: list[str],
-    extra_rel: list[str],
+    extra_pat: list[str] | tuple[str, ...],
+    extra_rel: list[str] | tuple[str, ...],
     pseudonym: str | None,
     detector: PIIDetector,
+    local_propagate: bool = False,
 ) -> tuple[str, dict[str, int]]:
     """Redact one chunk of plain text and return (cleaned_chunk, chunk_entity_counts)."""
     counts: dict[str, int] = {}
@@ -1219,6 +1254,7 @@ def redact_text_chunk(
         allow_pin_scan=True,
         pseudonym=pseudonym,
         entity_counts=counts,
+        local_propagate=local_propagate,
     )
     return cleaned, counts
 
@@ -1277,8 +1313,9 @@ def _sanitize_text_doc(
     uid = rc.unit_id if rc else f"{rel}|doc"
     psn = unit_to_psn.get(uid)
     prof = unit_profiles.get(uid)
-    extra_pat = rc.patient_names if rc else []
-    extra_rel = rc.relative_names if rc else []
+    extra_pat = rc.patient_names if (rc and len(rc.patient_names) <= 200) else ()
+    extra_rel = rc.relative_names if (rc and len(rc.relative_names) <= 200) else ()
+    local_prop = bool(rc and (len(rc.patient_names) > 200 or len(rc.relative_names) > 200))
 
     if (not rc or not rc.is_patient_record) and not detector.detect_text(text, allow_pin_scan=False):
         records_out.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": None})

@@ -36,7 +36,33 @@ def write_outputs(
     n_san = sum(1 for e in file_entries if e.get("status") == "sanitized")
     n_quar = sum(1 for e in file_entries if e.get("status") == "quarantined")
     n_linked = sum(1 for r in clean_records if r.get("patient") is not None)
+    write_report_json(
+        output_dir=output_dir,
+        file_entries=file_entries,
+        records_processed=len(clean_records),
+        records_linked=n_linked,
+        entity_counts=entity_counts,
+        stats=stats,
+        elapsed_seconds=elapsed_seconds,
+        n_sanitized=n_san,
+        n_quarantined=n_quar,
+    )
 
+
+def write_report_json(
+    output_dir: Path,
+    file_entries: list[dict[str, Any]],
+    records_processed: int,
+    records_linked: int,
+    entity_counts: dict[str, int],
+    stats: dict[str, int],
+    elapsed_seconds: float,
+    n_sanitized: int | None = None,
+    n_quarantined: int | None = None,
+) -> None:
+    """Write report.json without holding full records.jsonl rows in memory."""
+    n_san = sum(1 for e in file_entries if e.get("status") == "sanitized") if n_sanitized is None else n_sanitized
+    n_quar = sum(1 for e in file_entries if e.get("status") == "quarantined") if n_quarantined is None else n_quarantined
     report = {
         "schema": "raksha-report/1",
         "files": file_entries,
@@ -44,9 +70,9 @@ def write_outputs(
             "files_total": len(file_entries),
             "files_sanitized": n_san,
             "files_quarantined": n_quar,
-            "records_processed": len(clean_records),
+            "records_processed": records_processed,
             "identifiers_detected": int(stats.get("identifiers_detected", 0)),
-            "records_linked": n_linked,
+            "records_linked": records_linked,
             "records_generalized": int(stats.get("records_generalized", 0)),
             "records_suppressed": int(stats.get("records_suppressed", 0)),
             "records_quarantined": int(stats.get("records_quarantined", 0)),
