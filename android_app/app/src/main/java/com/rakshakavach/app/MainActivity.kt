@@ -1,7 +1,6 @@
 package com.rakshakavach.app
 
 import android.annotation.SuppressLint
-import android.app.AlertDialog
 import android.app.DownloadManager
 import android.content.Intent
 import android.net.Uri
@@ -11,25 +10,26 @@ import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
-    private lateinit var tvServerUrl: TextView
+    private lateinit var tvStatus: TextView
+    private var localUrl: String? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private val bgExecutor = Executors.newSingleThreadExecutor()
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -58,8 +58,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         webView = findViewById(R.id.webView)
-        tvServerUrl = findViewById(R.id.tvServerUrl)
-        val btnServer = findViewById<Button>(R.id.btnServer)
+        tvStatus = findViewById(R.id.tvStatus)
         val btnReload = findViewById<Button>(R.id.btnReload)
 
         webView.settings.apply {
@@ -71,30 +70,7 @@ class MainActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         }
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun onReceivedError(
-                view: WebView,
-                request: WebResourceRequest,
-                error: WebResourceError
-            ) {
-                if (!request.isForMainFrame) return
-                val url = getServerUrl()
-                val html = """
-                    <html><body style="font-family:sans-serif;padding:24px;background:#f8fafc;color:#0f172a;">
-                      <h2 style="color:#0b1f3a;">Raksha Kavach Server Not Reachable</h2>
-                      <p>Could not connect to <code>$url</code>.</p>
-                      <ul>
-                        <li>Start the Python GUI on your Mac:<br>
-                            <code>.venv/bin/python gui.py --host 0.0.0.0 --port 8573</code></li>
-                        <li>For USB debugging: run <code>adb reverse tcp:8573 tcp:8573</code> and use <code>http://127.0.0.1:8573/</code>.</li>
-                        <li>For Android Emulator: tap <b>Server</b> and choose <code>http://10.0.2.2:8573/</code>.</li>
-                        <li>For Wi-Fi phone: tap <b>Server</b> and enter your Mac's LAN IP, e.g. <code>http://192.168.1.10:8573/</code>.</li>
-                      </ul>
-                    </body></html>
-                """.trimIndent()
-                view.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
-            }
-        }
+        webView.webViewClient = WebViewClient()
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onShowFileChooser(
@@ -134,8 +110,9 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Downloading sanitized output...", Toast.LENGTH_SHORT).show()
         }
 
-        btnServer.setOnClickListener { showServerDialog() }
-        btnReload.setOnClickListener { loadCurrentUrl() }
+        btnReload.setOnClickListener {
+            localUrl?.let { webView.loadUrl(it) } ?: startEmbeddedEngine()
+        }
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -148,54 +125,58 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        loadCurrentUrl()
+        showLoadingPage()
+        startEmbeddedEngine()
     }
 
-    private fun getServerUrl(): String {
-        val prefs = getSharedPreferences("raksha_prefs", MODE_PRIVATE)
-        return prefs.getString("server_url", "http://127.0.0.1:8573/") ?: "http://127.0.0.1:8573/"
+    private fun showLoadingPage() {
+        val html = """
+            <html><body style="font-family:sans-serif;padding:28px;background:#f8fafc;color:#0f172a;">
+              <h2 style="color:#0b1f3a;">Raksha Kavach &mdash; Offline On-Device</h2>
+              <p>Initializing embedded Python privacy firewall engine...</p>
+            </body></html>
+        """.trimIndent()
+        webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
     }
 
-    private fun saveServerUrl(raw: String) {
-        var cleaned = raw.trim()
-        if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
-            cleaned = "http://$cleaned"
+    private fun startEmbeddedEngine() {
+        bgExecutor.execute {
+            try {
+                if (!Python.isStarted()) {
+                    Python.start(AndroidPlatform(applicationContext))
+                }
+                val py = Python.getInstance()
+                val guiMod = py.getModule("gui")
+                val url = guiMod.callAttr(
+                    "start_background_server",
+                    "127.0.0.1",
+                    8573,
+                    filesDir.absolutePath
+                ).toString()
+
+                runOnUiThread {
+                    localUrl = url
+                    tvStatus.text = "Offline On-Device ($url)"
+                    webView.loadUrl(url)
+                }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    tvStatus.text = "Engine startup error"
+                    val msg = t.message?.replace("<", "&lt;") ?: "Unknown error"
+                    val html = """
+                        <html><body style="font-family:sans-serif;padding:24px;background:#fff1f2;color:#881337;">
+                          <h3>Embedded Python Startup Failed</h3>
+                          <pre style="white-space:pre-wrap;">$msg</pre>
+                        </body></html>
+                    """.trimIndent()
+                    webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+                }
+            }
         }
-        if (!cleaned.endsWith("/")) {
-            cleaned += "/"
-        }
-        getSharedPreferences("raksha_prefs", MODE_PRIVATE)
-            .edit()
-            .putString("server_url", cleaned)
-            .apply()
-        loadCurrentUrl()
     }
 
-    private fun loadCurrentUrl() {
-        val url = getServerUrl()
-        tvServerUrl.text = url
-        webView.loadUrl(url)
-    }
-
-    private fun showServerDialog() {
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 24, 48, 8)
-        }
-        val input = EditText(this).apply {
-            setText(getServerUrl())
-            hint = "http://192.168.x.x:8573/"
-            setSingleLine(true)
-        }
-        container.addView(input)
-
-        AlertDialog.Builder(this)
-            .setTitle("Raksha Kavach Backend URL")
-            .setMessage("Use 127.0.0.1 (USB adb reverse), 10.0.2.2 (Emulator), or your Mac's Wi-Fi IP.")
-            .setView(container)
-            .setPositiveButton("Connect") { _, _ -> saveServerUrl(input.text.toString()) }
-            .setNeutralButton("Emulator (10.0.2.2)") { _, _ -> saveServerUrl("http://10.0.2.2:8573/") }
-            .setNegativeButton("USB (127.0.0.1)") { _, _ -> saveServerUrl("http://127.0.0.1:8573/") }
-            .show()
+    override fun onDestroy() {
+        bgExecutor.shutdownNow()
+        super.onDestroy()
     }
 }

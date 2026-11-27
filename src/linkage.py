@@ -15,6 +15,7 @@ from .detection import (
     _consonant_skeleton,
     canonicalize_person_name,
     canonicalize_place,
+    fuzz,
     names_similarity,
     places_similarity,
     shadow_normalize,
@@ -1568,7 +1569,6 @@ def _best_given_name_sim(c1: PatientCluster | RecordClues, c2: PatientCluster | 
     g2 = [ct[0] for n in c2.patient_names[:12] if (ct := _canonicalize_person_name_cached(n))]
     if not g1 or not g2:
         return 0.0
-    from rapidfuzz import fuzz
     if len(g1) == 1 and len(g2) == 1:
         return 1.0 if g1[0] == g2[0] else (fuzz.ratio(g1[0], g2[0]) / 100.0)
     return max(fuzz.ratio(a, b) / 100.0 for a in g1 for b in g2)
@@ -1581,7 +1581,6 @@ def _best_rel_sim(c1: PatientCluster | RecordClues, c2: PatientCluster | RecordC
         return 0.0
     if len(r1) == 1 and len(r2) == 1 and r1[0] == r2[0]:
         return 1.0
-    from rapidfuzz import fuzz
     best = 0.0
     for a in r1:
         ta = _canonicalize_person_name_cached(a)

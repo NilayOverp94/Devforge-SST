@@ -37,11 +37,13 @@ from src.privacy import build_privacy_profiles, sanitize_file
 from src.security import KeyRing
 
 REPO_ROOT = Path(__file__).resolve().parent
+DATA_ROOT = Path(os.environ["RAKSHA_DATA_DIR"]).resolve() if os.environ.get("RAKSHA_DATA_DIR") else REPO_ROOT
 GUI_DIR = REPO_ROOT / "gui"
 POLICY_PATH = REPO_ROOT / "config" / "policy.yaml"
 TOOLKIT_DIR = REPO_ROOT.parent / "Secret-Wards-ToolKit"
 _AUTO_SESSION_KEY = os.environ.get("RAKSHA_SECRET") or secrets.token_hex(32)
 _STAGING_LOCK = threading.Lock()
+_INPROC_LOCK = threading.Lock()
 _STAGING_DIRS: dict[str, Path] = {}
 MAX_UI_CLUSTERS = 500
 MAX_STAGED_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
@@ -137,37 +139,63 @@ def _run_pipeline_subprocess(
         pol_file = Path(tmp) / "policy.yaml"
         pol_file.write_text(yaml.safe_dump(eff_policy, sort_keys=False), encoding="utf-8")
 
-        env = dict(os.environ)
-        env["RAKSHA_SECRET"] = secret or _AUTO_SESSION_KEY
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
+        if hasattr(sys, "getandroidapilevel") or os.environ.get("RAKSHA_INPROC_PIPELINE") == "1":
+            import contextlib
+            import main as pipeline_main
 
-        proc = subprocess.run(
-            [
-                sys.executable,
-                str(REPO_ROOT / "main.py"),
-                "--input", str(inp_dir),
-                "--output", str(out_dir),
-                "--policy", str(pol_file),
-            ],
-            cwd=REPO_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=3600,
-        )
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with _INPROC_LOCK:
+                prev_secret = os.environ.get("RAKSHA_SECRET")
+                os.environ["RAKSHA_SECRET"] = secret or _AUTO_SESSION_KEY
+                try:
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = pipeline_main.run_pipeline(inp_dir=inp_dir, out_dir=out_dir, policy_path=pol_file)
+                except Exception as exc:
+                    rc = 1
+                    buf_err.write(str(exc))
+                finally:
+                    if prev_secret is None:
+                        os.environ.pop("RAKSHA_SECRET", None)
+                    else:
+                        os.environ["RAKSHA_SECRET"] = prev_secret
+            out_txt = buf_out.getvalue()
+            err_txt = buf_err.getvalue()
+        else:
+            env = dict(os.environ)
+            env["RAKSHA_SECRET"] = secret or _AUTO_SESSION_KEY
+            env["HF_HUB_OFFLINE"] = "1"
+            env["TRANSFORMERS_OFFLINE"] = "1"
 
-    if proc.returncode != 0:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "main.py"),
+                    "--input", str(inp_dir),
+                    "--output", str(out_dir),
+                    "--policy", str(pol_file),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=3600,
+            )
+            rc = proc.returncode
+            out_txt = proc.stdout
+            err_txt = proc.stderr
+
+    if rc != 0:
         return 500, {
             "ok": False,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip()[-1000:],
+            "returncode": rc,
+            "stdout": out_txt.strip(),
+            "stderr": err_txt.strip()[-1000:],
         }
 
     summary = _summarize_output(out_dir)
     summary["ok"] = True
-    summary["cli_summary"] = proc.stdout.strip()
+    summary["cli_summary"] = out_txt.strip()
     return 200, summary
 
 
@@ -396,9 +424,9 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/defaults":
             dev_input = TOOLKIT_DIR / "dev" / "input"
-            out_default = REPO_ROOT / ".gui_output"
+            out_default = DATA_ROOT / ".gui_output"
             self._send_json({
-                "input_dir": str(dev_input) if dev_input.is_dir() else str(REPO_ROOT),
+                "input_dir": str(dev_input) if dev_input.is_dir() else ("" if hasattr(sys, "getandroidapilevel") else str(REPO_ROOT)),
                 "toolkit_input_dir": str(dev_input) if dev_input.is_dir() else "",
                 "output_dir": str(out_default),
                 "toolkit_present": TOOLKIT_DIR.is_dir(),
@@ -413,7 +441,7 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/results":
-            out_dir = Path(qs.get("output_dir", [str(REPO_ROOT / ".gui_output")])[0]).expanduser().resolve()
+            out_dir = Path(qs.get("output_dir", [str(DATA_ROOT / ".gui_output")])[0]).expanduser().resolve()
             self._send_json(_summarize_output(out_dir))
             return
 
@@ -778,6 +806,35 @@ def pick_port(preferred: int) -> int:
             if s.connect_ex(("127.0.0.1", port)) != 0:
                 return port
     return preferred
+
+
+_BG_SERVER: ReusableThreadingServer | None = None
+_BG_URL: str | None = None
+_BG_LOCK = threading.Lock()
+
+
+def start_background_server(
+    host: str = "127.0.0.1",
+    port: int = 8573,
+    data_dir: str | None = None,
+) -> str:
+    """Start the offline GUI server inside a daemon thread (used by standalone Android APK)."""
+    global DATA_ROOT, _BG_SERVER, _BG_URL
+    with _BG_LOCK:
+        if _BG_URL is not None:
+            return _BG_URL
+        if data_dir:
+            data_path = Path(data_dir).resolve()
+            data_path.mkdir(parents=True, exist_ok=True)
+            os.environ["RAKSHA_DATA_DIR"] = str(data_path)
+            DATA_ROOT = data_path
+        chosen_port = pick_port(port)
+        srv = ReusableThreadingServer((host, chosen_port), RakshaHandler)
+        _BG_SERVER = srv
+        _BG_URL = f"http://{host}:{chosen_port}/"
+        t = threading.Thread(target=srv.serve_forever, name="raksha-gui-httpd", daemon=True)
+        t.start()
+        return _BG_URL
 
 
 def main() -> int:

@@ -7,7 +7,7 @@
 
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="48dp"
+        android:layout_height="46dp"
         android:background="#0B1F3A"
         android:gravity="center_vertical"
         android:orientation="horizontal"
@@ -15,28 +15,15 @@
         android:paddingEnd="10dp">
 
         <TextView
-            android:id="@+id/tvServerUrl"
+            android:id="@+id/tvStatus"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:ellipsize="end"
             android:maxLines="1"
-            android:text="http://127.0.0.1:8573/"
+            android:text="Starting offline Raksha Kavach engine..."
             android:textColor="#E2E8F0"
             android:textSize="13sp" />
-
-        <Button
-            android:id="@+id/btnServer"
-            android:layout_width="wrap_content"
-            android:layout_height="34dp"
-            android:layout_marginEnd="6dp"
-            android:backgroundTint="#1E3A5F"
-            android:minWidth="0dp"
-            android:paddingHorizontal="12dp"
-            android:text="Server"
-            android:textAllCaps="false"
-            android:textColor="#FFFFFF"
-            android:textSize="12sp" />
 
         <Button
             android:id="@+id/btnReload"

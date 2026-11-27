@@ -62,6 +62,8 @@ _WORKER_DETECTOR: PIIDetector | None = None
 
 
 def _available_cpus() -> int:
+    if hasattr(sys, "getandroidapilevel") or os.environ.get("RAKSHA_NO_MP") == "1":
+        return 1
     try:
         return max(1, len(os.sched_getaffinity(0)))
     except AttributeError:
@@ -1654,20 +1656,12 @@ def _stream_sanitize_json_array_file(
     return n_recs, n_linked
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Raksha Kavach Privacy Firewall")
-    ap.add_argument("--input", required=True, help="Read-only input directory")
-    ap.add_argument("--output", required=True, help="Output directory")
-    ap.add_argument("--policy", default=None, help="Optional path to policy.yaml")
-    args = ap.parse_args()
-
+def run_pipeline(inp_dir: Path, out_dir: Path, policy_path: Path | None = None) -> int:
     t0 = time.monotonic()
     root_dir = Path(__file__).resolve().parent
-    policy_path = Path(args.policy) if args.policy else (root_dir / "config" / "policy.yaml")
-    policy = load_policy(policy_path)
+    eff_policy_path = policy_path if policy_path is not None else (root_dir / "config" / "policy.yaml")
+    policy = load_policy(eff_policy_path)
 
-    inp_dir = Path(args.input)
-    out_dir = Path(args.output)
     san_dir = out_dir / "sanitized"
     san_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1689,6 +1683,20 @@ def main() -> int:
     if total_bytes <= 25_000_000 and max_size <= 10_000_000:
         return _run_in_memory(inp_dir, out_dir, san_dir, policy, keyring, vault, detector, t0)
     return _run_streaming(inp_dir, out_dir, san_dir, policy, keyring, vault, detector, paths, total_bytes, t0)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Raksha Kavach Privacy Firewall")
+    ap.add_argument("--input", required=True, help="Read-only input directory")
+    ap.add_argument("--output", required=True, help="Output directory")
+    ap.add_argument("--policy", default=None, help="Optional path to policy.yaml")
+    args = ap.parse_args()
+
+    return run_pipeline(
+        inp_dir=Path(args.input),
+        out_dir=Path(args.output),
+        policy_path=Path(args.policy) if args.policy else None,
+    )
 
 
 if __name__ == "__main__":

@@ -15,7 +15,28 @@ from typing import Any
 import phonenumbers
 import regex
 from indic_transliteration import sanscript
-from rapidfuzz import fuzz
+
+try:
+    from rapidfuzz import fuzz
+except ImportError:  # Pure-Python fallback for mobile/Chaquopy runtimes without C++ wheels
+    from difflib import SequenceMatcher as _SequenceMatcher
+
+    class _PureFuzz:
+        @staticmethod
+        def ratio(a: str, b: str) -> float:
+            if not a and not b:
+                return 100.0
+            return _SequenceMatcher(None, a, b).ratio() * 100.0
+
+        @staticmethod
+        def token_sort_ratio(a: str, b: str) -> float:
+            ta = " ".join(sorted(a.split()))
+            tb = " ".join(sorted(b.split()))
+            if not ta and not tb:
+                return 100.0
+            return _SequenceMatcher(None, ta, tb).ratio() * 100.0
+
+    fuzz = _PureFuzz()
 
 
 # --------------------------------------------------------------------------- Script & Phonetic Normalization
