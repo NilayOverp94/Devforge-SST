@@ -1,0 +1,70 @@
+name: Build Desktop Installers (.dmg & .exe)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "gui.py"
+      - "desktop_launcher.py"
+      - "requirements.txt"
+      - "src/**"
+      - "gui/**"
+      - "config/**"
+      - ".github/workflows/build-installers.yml"
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Build RakshaKavach.exe
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name RakshaKavach `
+            --add-data "gui;gui" `
+            --add-data "config;config" `
+            --collect-data indic_transliteration `
+            --collect-data phonenumbers `
+            --hidden-import main `
+            desktop_launcher.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RakshaKavach-Windows-exe
+          path: dist/RakshaKavach.exe
+
+  build-macos-dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Build Raksha Kavach.app and .dmg
+        run: |
+          pyinstaller --noconfirm --windowed --name "Raksha Kavach" \
+            --add-data "gui:gui" \
+            --add-data "config:config" \
+            --collect-data indic_transliteration \
+            --collect-data phonenumbers \
+            --hidden-import main \
+            desktop_launcher.py
+          mkdir -p dist/dmg_stage
+          cp -R "dist/Raksha Kavach.app" dist/dmg_stage/
+          ln -s /Applications dist/dmg_stage/Applications
+          hdiutil create -volname "Raksha Kavach" -srcfolder dist/dmg_stage -ov -format UDZO dist/Raksha-Kavach-macOS.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Raksha-Kavach-macOS-dmg
+          path: dist/Raksha-Kavach-macOS.dmg

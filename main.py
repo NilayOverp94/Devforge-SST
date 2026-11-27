@@ -1658,7 +1658,7 @@ def _stream_sanitize_json_array_file(
 
 def run_pipeline(inp_dir: Path, out_dir: Path, policy_path: Path | None = None) -> int:
     t0 = time.monotonic()
-    root_dir = Path(__file__).resolve().parent
+    root_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     eff_policy_path = policy_path if policy_path is not None else (root_dir / "config" / "policy.yaml")
     policy = load_policy(eff_policy_path)
 

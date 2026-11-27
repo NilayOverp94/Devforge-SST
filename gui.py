@@ -36,8 +36,13 @@ from src.linkage import extract_clues_from_file, infer_file_date_hints, link_all
 from src.privacy import build_privacy_profiles, sanitize_file
 from src.security import KeyRing
 
-REPO_ROOT = Path(__file__).resolve().parent
-DATA_ROOT = Path(os.environ["RAKSHA_DATA_DIR"]).resolve() if os.environ.get("RAKSHA_DATA_DIR") else REPO_ROOT
+REPO_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)).resolve()
+if os.environ.get("RAKSHA_DATA_DIR"):
+    DATA_ROOT = Path(os.environ["RAKSHA_DATA_DIR"]).resolve()
+elif getattr(sys, "frozen", False):
+    DATA_ROOT = (Path.home() / "RakshaKavachData").resolve()
+else:
+    DATA_ROOT = REPO_ROOT
 GUI_DIR = REPO_ROOT / "gui"
 POLICY_PATH = REPO_ROOT / "config" / "policy.yaml"
 TOOLKIT_DIR = REPO_ROOT.parent / "Secret-Wards-ToolKit"
@@ -50,9 +55,11 @@ MAX_STAGED_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
 
 
 def _load_policy_dict() -> dict[str, Any]:
-    if not POLICY_PATH.is_file():
+    override_pol = DATA_ROOT / "policy.yaml"
+    target = override_pol if (DATA_ROOT != REPO_ROOT and override_pol.is_file()) else POLICY_PATH
+    if not target.is_file():
         return {}
-    data = yaml.safe_load(POLICY_PATH.read_text(encoding="utf-8"))
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
     return data if isinstance(data, dict) else {}
 
 
@@ -139,7 +146,7 @@ def _run_pipeline_subprocess(
         pol_file = Path(tmp) / "policy.yaml"
         pol_file.write_text(yaml.safe_dump(eff_policy, sort_keys=False), encoding="utf-8")
 
-        if hasattr(sys, "getandroidapilevel") or os.environ.get("RAKSHA_INPROC_PIPELINE") == "1":
+        if hasattr(sys, "getandroidapilevel") or os.environ.get("RAKSHA_INPROC_PIPELINE") == "1" or getattr(sys, "frozen", False):
             import contextlib
             import main as pipeline_main
 
@@ -425,8 +432,9 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/defaults":
             dev_input = TOOLKIT_DIR / "dev" / "input"
             out_default = DATA_ROOT / ".gui_output"
+            fallback_inp = "" if (hasattr(sys, "getandroidapilevel") or getattr(sys, "frozen", False)) else str(REPO_ROOT)
             self._send_json({
-                "input_dir": str(dev_input) if dev_input.is_dir() else ("" if hasattr(sys, "getandroidapilevel") else str(REPO_ROOT)),
+                "input_dir": str(dev_input) if dev_input.is_dir() else fallback_inp,
                 "toolkit_input_dir": str(dev_input) if dev_input.is_dir() else "",
                 "output_dir": str(out_default),
                 "toolkit_present": TOOLKIT_DIR.is_dir(),
@@ -637,7 +645,9 @@ class RakshaHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/policy":
             updated = _sanitize_policy_updates(body.get("policy") or body, _load_policy_dict())
-            POLICY_PATH.write_text(yaml.safe_dump(updated, sort_keys=False), encoding="utf-8")
+            save_pol = (DATA_ROOT / "policy.yaml") if DATA_ROOT != REPO_ROOT else POLICY_PATH
+            save_pol.parent.mkdir(parents=True, exist_ok=True)
+            save_pol.write_text(yaml.safe_dump(updated, sort_keys=False), encoding="utf-8")
             self._send_json({"ok": True, "policy": updated})
             return
 
