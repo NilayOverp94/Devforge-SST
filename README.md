@@ -2,7 +2,17 @@
 
 **Track 3: "Secret Wards" · Yugaantar DevForge Hackathon**
 
-Raksha Kavach (`raksha-kavach`) is an **offline, CPU-only, LLM-free privacy firewall** written in Python for clinical datasets in English, Hindi (Devanagari), and Hinglish. It detects and removes direct and indirect personal identifiers across unstructured notes, structured CSV/TSV/JSON exports, FHIR R4 Bundles, filenames, headers, JSON keys, metadata paths, and base64 attachments; preserves clinical utility (medications, doses, frequencies, vitals, labs, diagnoses, procedures, length of stay, and truthful age bands); links records of the same patient across scripts and hospitals via keyed HMAC-SHA256 pseudonyms without false merges; and hardens quasi-identifiers against re-identification linkage attacks.
+## About
+
+**Raksha Kavach** (`raksha-kavach`) is an **offline, CPU-only, LLM-free privacy firewall** written in Python for clinical datasets in **English, Hindi (Devanagari), and Hinglish**. It detects and removes direct and indirect personal identifiers across unstructured notes, structured CSV/TSV/JSON exports, FHIR R4 Bundles, filenames, headers, JSON keys, metadata paths, and base64 attachments; preserves clinical utility (medications, doses, frequencies, vitals, labs, diagnoses, procedures, length of stay, and truthful age bands); links records of the same patient across scripts and hospitals via keyed HMAC-SHA256 pseudonyms without false merges; and hardens quasi-identifiers against re-identification linkage attacks — scaling up to **multi-GB dumps (~4.95M records in ~236s under ~3.1 GB RAM)**.
+
+### Standalone App Installers & Packages (`.apk` · `.dmg` · `.exe`)
+
+| Platform | Package | How to Run / Download |
+| :--- | :--- | :--- |
+| **macOS** (Apple Silicon / Desktop) | **`.dmg`** (`Raksha-Kavach-macOS.dmg`) | Download **`Raksha-Kavach-macOS-dmg`** from [GitHub Actions Builds](https://github.com/NilayOverp94/Devforge-SST/actions/workflows/build-installers.yml) (or [Releases](https://github.com/NilayOverp94/Devforge-SST/releases)). Drag `Raksha Kavach.app` to Applications and launch the offline console locally. |
+| **Windows** (x64 Desktop) | **`.exe`** (`RakshaKavach.exe`) | Download **`RakshaKavach-Windows-exe`** from [GitHub Actions Builds](https://github.com/NilayOverp94/Devforge-SST/actions/workflows/build-installers.yml) (or [Releases](https://github.com/NilayOverp94/Devforge-SST/releases)). Double-click `RakshaKavach.exe` to run 100% offline with zero Python setup. |
+| **Android** (On-Device Standalone) | **`.apk`** (`app-debug.apk`) | Download **`RakshaKavach-Android-apk`** from [GitHub Actions Builds](https://github.com/NilayOverp94/Devforge-SST/actions/workflows/build-installers.yml) (or open [`android_app/`](./android_app/README.md) in Android Studio). Runs embedded Python (`Chaquopy 17.2.0` + `127.0.0.1`) completely on-device with no external server. |
 
 ---
 
