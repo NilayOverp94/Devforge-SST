@@ -18,7 +18,7 @@ tasks.named("preBuild").configure {
     dependsOn(syncRakshaPython)
 }
 
-tasks.matching { it.name.contains("Python", ignoreCase = true) }.configureEach {
+tasks.matching { it.name != "syncRakshaPython" && it.name.contains("Python", ignoreCase = true) }.configureEach {
     dependsOn(syncRakshaPython)
 }
 
@@ -34,7 +34,7 @@ android {
         versionName = "1.0"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            abiFilters += listOf("arm64-v8a", "x86_64")
         }
     }
 
@@ -52,14 +52,26 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
 chaquopy {
     defaultConfig {
-        version = "3.12"
+        version = "3.13"
+        val py313 = listOf(
+            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13",
+            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+            "/opt/homebrew/bin/python3.13",
+            "/usr/local/bin/python3.13",
+        ).firstOrNull { file(it).exists() }
+        if (py313 != null) {
+            buildPython(py313)
+        }
         pip {
             install("PyYAML>=6.0.0")
             install("phonenumbers>=8.13.0")
