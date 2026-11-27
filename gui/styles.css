@@ -506,6 +506,31 @@ input:focus, select:focus, textarea:focus {
   white-space: pre-wrap;
   word-break: break-word;
 }
+.code-viewer:has(.inspector-table) {
+  padding: 0;
+  white-space: normal;
+  word-break: normal;
+}
+.inspector-table {
+  width: max-content;
+  min-width: 100%;
+  font-family: var(--sans);
+  font-size: 12.5px;
+}
+.inspector-table th {
+  white-space: nowrap;
+}
+.inspector-table td {
+  white-space: nowrap;
+  vertical-align: top;
+}
+.inspector-table td.cell-wrap {
+  white-space: normal;
+  min-width: 260px;
+  max-width: 420px;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
 
 /* Sandbox highlights */
 .sandbox-controls { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 10px; flex-wrap: wrap; }

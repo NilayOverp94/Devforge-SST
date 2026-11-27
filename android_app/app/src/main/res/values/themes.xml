@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.RakshaKavach" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorPrimary">#0F766E</item>
+        <item name="colorPrimaryDark">#0B1F3A</item>
+        <item name="colorAccent">#0D9488</item>
+        <item name="android:statusBarColor">#0B1F3A</item>
+    </style>
+</resources>

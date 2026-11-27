@@ -337,8 +337,8 @@ async function openInspector(relOut, sha) {
   const sanView = document.getElementById("sanitized-view");
   if (data.csv_rows && data.csv_rows.length) {
     const [hdr, ...rows] = data.csv_rows;
-    sanView.innerHTML = `<table class="data-table"><thead><tr>${hdr.map(h => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${
-      rows.map(r => `<tr>${r.map(c => `<td>${highlightSanitized(c)}</td>`).join("")}</tr>`).join("")
+    sanView.innerHTML = `<table class="data-table inspector-table"><thead><tr>${hdr.map(h => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${
+      rows.map(r => `<tr>${r.map(c => `<td${String(c).length > 36 ? ' class="cell-wrap"' : ""}>${highlightSanitized(c)}</td>`).join("")}</tr>`).join("")
     }</tbody></table>`;
   } else {
     sanView.innerHTML = `<pre class="code-pre" style="padding:0;max-height:none">${highlightSanitized(data.sanitized_content || "Unable to read file.")}</pre>`;

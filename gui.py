@@ -782,14 +782,16 @@ def pick_port(preferred: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Raksha Kavach Local Offline GUI Console")
+    ap.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1; use 0.0.0.0 for LAN/Android)")
     ap.add_argument("--port", type=int, default=8573, help="Localhost port (default: 8573)")
     ap.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
     args = ap.parse_args()
 
     port = pick_port(args.port)
-    url = f"http://127.0.0.1:{port}/"
-    srv = ReusableThreadingServer(("127.0.0.1", port), RakshaHandler)
-    print(f"Raksha Kavach Console running offline at {url} (Press Ctrl+C to stop)")
+    display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    url = f"http://{display_host}:{port}/"
+    srv = ReusableThreadingServer((args.host, port), RakshaHandler)
+    print(f"Raksha Kavach Console running offline at {url} (bound to {args.host}:{port}; Press Ctrl+C to stop)")
     if not args.no_browser:
         webbrowser.open(url)
     try:
